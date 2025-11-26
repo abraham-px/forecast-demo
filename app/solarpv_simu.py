@@ -86,16 +86,21 @@ def query_influx_frame(
     site: Optional[str] = None,
 ) -> pd.DataFrame:
     field_filter = _build_flux_filter_list(fields, "_field")
-    tag_filter = f' and r["site"] == "{site}"' if site else ""
+    field_filter_block = (
+        f'  |> filter(fn: (r) => {field_filter})\n' if field_filter else ""
+    )
+    tag_filter_block = (
+        f'  |> filter(fn: (r) => r["site"] == "{site}")\n' if site else ""
+    )
     flux = f"""
 from(bucket: \"{bucket}\")
   |> range(start: time(v: \"{start.isoformat()}\"), stop: time(v: \"{stop.isoformat()}\"))
   |> filter(fn: (r) => r[\"_measurement\"] == \"{measurement}\")
-  |> filter(fn: (r) => {field_filter}){tag_filter}
-  |> keep(columns: [\"_time\", \"_field\", \"_value\"])
+{field_filter_block}{tag_filter_block}  |> keep(columns: [\"_time\", \"_field\", \"_value\"])
   |> pivot(rowKey: [\"_time\"], columnKey: [\"_field\"], valueColumn: \"_value\")
   |> sort(columns: [\"_time\"])
 """
+    flux = "\n".join(line for line in flux.splitlines() if line.strip())
     query_api = client.query_api()
     frames = query_api.query_data_frame(org=client.org, query=flux)
     if isinstance(frames, list):

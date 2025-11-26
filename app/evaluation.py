@@ -60,16 +60,21 @@ def query_influx(
     site: Optional[str] = None,
 ) -> pd.DataFrame:
     field_clause = _build_filter_clause(fields, "_field")
-    tag_filter = f' and r["site"] == "{site}"' if site else ""
+    field_filter_block = (
+        f'  |> filter(fn: (r) => {field_clause})\n' if field_clause else ""
+    )
+    tag_filter_block = (
+        f'  |> filter(fn: (r) => r["site"] == "{site}")\n' if site else ""
+    )
     flux = f"""
 from(bucket: "{bucket}")
   |> range(start: time(v: "{start.isoformat()}"), stop: time(v: "{stop.isoformat()}"))
   |> filter(fn: (r) => r["_measurement"] == "{measurement}")
-  |> filter(fn: (r) => {field_clause}){tag_filter}
-  |> keep(columns: ["_time", "_field", "_value"])
+{field_filter_block}{tag_filter_block}  |> keep(columns: ["_time", "_field", "_value"])
   |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
   |> sort(columns: ["_time"])
 """
+    flux = "\n".join(line for line in flux.splitlines() if line.strip())
     frames = client.query_api().query_data_frame(org=client.org, query=flux)
     if isinstance(frames, list):
         frames = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
