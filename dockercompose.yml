@@ -1,0 +1,14 @@
+version: "3.9"
+
+services:
+  forecast-agents:
+    build:
+      context: .
+      dockerfile: dockerfile
+    container_name: epc1522-demo
+    env_file:
+      - .env
+    volumes:
+      - ./model:/app/model
+    restart: unless-stopped
+    command: ["python", "app/scheduler.py"]
