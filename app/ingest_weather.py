@@ -112,7 +112,7 @@ def fetch_open_meteo_forecast(
     frame = frame[~frame.index.duplicated(keep="last")]
 
     # Limit to requested horizon starting from now (UTC)
-    now = pd.Timestamp.utcnow().tz_localize("UTC")
+    now = pd.Timestamp.now(tz="UTC")
     end_time = now + pd.Timedelta(hours=hours)
     trimmed = frame[(frame.index >= now) & (frame.index <= end_time)]
     if trimmed.empty:

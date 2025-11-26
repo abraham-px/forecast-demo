@@ -198,7 +198,7 @@ def write_forecasts(
         return 0
 
     tags = tags or {}
-    issued_at = pd.Timestamp.utcnow().tz_localize("UTC")
+    issued_at = pd.Timestamp.now(tz="UTC")
     records = []
     for _, row in df.iterrows():
         point = (
@@ -246,7 +246,7 @@ def build_config_from_args(args: argparse.Namespace) -> SolarPVSimConfig:
 def run_simulation(config: SolarPVSimConfig) -> int:
     if InfluxDBClient is None:
         raise RuntimeError("influxdb-client is required for PV simulation")
-    now = pd.Timestamp.utcnow().tz_localize("UTC")
+    now = pd.Timestamp.now(tz="UTC")
     horizon_end = now + pd.Timedelta(hours=config.horizon_hours)
 
     with InfluxDBClient(

@@ -247,7 +247,7 @@ def write_forecasts(
 
     records: List[Point] = []
     tags = tags or {}
-    issued_at = pd.Timestamp.utcnow().tz_localize("UTC")
+    issued_at = pd.Timestamp.now(tz="UTC")
     for _, row in df.iterrows():
         point = (
             Point(measurement)
@@ -282,7 +282,7 @@ def build_config_from_args(args: argparse.Namespace) -> LoadForecastConfig:
 
 def run_forecast(config: LoadForecastConfig) -> int:
     model = load_xgb_model(config.model_path)
-    now = pd.Timestamp.utcnow().floor("30min").tz_localize("UTC")
+    now = pd.Timestamp.now(tz="UTC").floor("30min")
     history_start = now - pd.Timedelta(hours=config.history_hours)
     forecast_end = now + pd.Timedelta(hours=config.horizon_hours)
 

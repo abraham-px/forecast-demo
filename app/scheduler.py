@@ -111,6 +111,20 @@ def build_pv_config_from_env() -> SolarPVSimConfig:
         model_name=_env_str("PV_MODEL_NAME", "pvlib_pvwatts"),
     )
 
+def build_evaluation_config_from_env() -> EvaluationConfig:
+    return EvaluationConfig(
+        site=_env_str("SITE_NAME", "default"),
+        window_hours=_env_int("EVALUATION_WINDOW_HOURS", 24),
+        actual_measurement=_env_str("HISTORICAL_MEASUREMENT", "historical_actuals"),
+        forecast_measurement=_env_str("FORECAST_MEASUREMENT", "forecasts"),
+        evaluation_measurement=_env_str("EVALUATION_MEASUREMENT", "evaluations"),
+        influx_url=_env_str("INFLUX_URL", ""),
+        influx_token=_env_str("INFLUX_TOKEN", ""),
+        influx_org=_env_str("INFLUX_ORG", ""),
+        influx_bucket=_env_str("INFLUX_BUCKET", ""),
+        verify_ssl=_to_bool(os.getenv("INFLUX_VERIFY_SSL"), True),
+    )
+
 
 def run_weather_job() -> None:
     config = build_weather_config_from_env()

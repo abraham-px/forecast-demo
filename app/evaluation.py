@@ -131,7 +131,7 @@ def write_evaluation(
 ) -> None:
     if Point is None:
         raise RuntimeError("influxdb-client package is required to write evaluation metrics")
-    issued_at = pd.Timestamp.utcnow().tz_localize("UTC")
+    issued_at = pd.Timestamp.now(tz="UTC")
     point = (
         Point(config.evaluation_measurement)
         .time(issued_at.to_pydatetime(), WritePrecision.NS)
@@ -150,7 +150,7 @@ def write_evaluation(
 def run_evaluation(config: EvaluationConfig) -> None:
     if InfluxDBClient is None:
         raise RuntimeError("influxdb-client package is required for evaluation")
-    now = pd.Timestamp.utcnow().tz_localize("UTC")
+    now = pd.Timestamp.now(tz="UTC")
     start = now - pd.Timedelta(hours=config.window_hours)
     with InfluxDBClient(
         url=config.influx_url,
