@@ -21,7 +21,7 @@ except ImportError:  # pragma: no cover
 
 LOGGER = logging.getLogger("backfill_historical")
 
-COLUMN_MAP = {
+ORIGINAL_FIELD_MAP = {
     "poiActvPwr": "poi_kw",
     "pvActvPwr": "pv_kw",
     "essPcsActvPwr": "ess_kw",
@@ -50,7 +50,7 @@ def configure_logging(level: str = "INFO") -> None:
 
 def load_csv(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path, parse_dates=["timestamp"])
-    df = df.rename(columns=COLUMN_MAP)
+    df = df.rename(columns=ORIGINAL_FIELD_MAP)
     df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize("UTC")
     df = df.sort_values("timestamp")
     return df
@@ -68,7 +68,7 @@ def write_frame(
     records = []
     for _, row in df.iterrows():
         point = Point(measurement).time(row["timestamp"].to_pydatetime(), WritePrecision.NS)
-        for _, influx_field in COLUMN_MAP.items():
+        for influx_field in ORIGINAL_FIELD_MAP.values():
             if influx_field in row and pd.notna(row[influx_field]):
                 point = point.field(influx_field, float(row[influx_field]))
         point = point.tag("site", site)
