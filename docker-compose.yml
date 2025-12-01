@@ -1,12 +1,30 @@
 services:
+  weather-ingest:
+    build:
+      context: .
+      dockerfile: dockerfile.weather
+    container_name: epc1522-weather
+    env_file:
+      - .env
+    restart: unless-stopped
+    command: ["python", "app/scheduler.py", "--jobs", "weather_ingest", "--poll-seconds", "60"]
+
   forecast-agents:
     build:
       context: .
-      dockerfile: dockerfile
-    container_name: epc1522-demo
+      dockerfile: dockerfile.forecast
+    container_name: epc1522-forecast
     env_file:
       - .env
     volumes:
       - ./model:/app/model
     restart: unless-stopped
-    command: ["python", "app/scheduler.py"]
+    command:
+      [
+        "python",
+        "app/scheduler.py",
+        "--jobs",
+        "load_forecast,pv_simulation,evaluation",
+        "--poll-seconds",
+        "60",
+      ]

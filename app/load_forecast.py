@@ -31,6 +31,7 @@ except ImportError:  # pragma: no cover - handled at runtime
     SYNCHRONOUS = None  # type: ignore[assignment]
 
 LOGGER = logging.getLogger("load_forecast")
+NETLOAD_LAGS = [1, 2, 24, 48, 72]
 FORECAST_FEATURES = [
     "Temperature",
     "temp_business_hr",
@@ -41,14 +42,20 @@ FORECAST_FEATURES = [
     "temp_squared",
     "hour_sin",
     "hour_cos",
+    "season",
     "is_business_hour",
     "month_sin",
     "month_cos",
     "day_of_week_sin",
     "day_of_week_cos",
     "is_weekday",
-    "time_frame",
     "is_holiday",
+    "week_of_year",
+    "NETLOAD_lag_1",
+    "NETLOAD_lag_2",
+    "NETLOAD_lag_24",
+    "NETLOAD_lag_48",
+    "NETLOAD_lag_72",
 ]
 
 
@@ -58,6 +65,7 @@ class LoadForecastConfig:
     horizon_hours: int
     history_hours: int
     weather_measurement: str
+    actual_measurement: str
     forecast_measurement: str
     model_path: Path
     influx_url: str
@@ -89,6 +97,16 @@ def _build_flux_filter_list(values: Iterable[str], field: str) -> str:
     if not clauses:
         return ""
     return " or ".join(clauses)
+
+
+def _calculate_season(month: int) -> int:
+    if month in (12, 1, 2):
+        return 0  # winter
+    if month in (3, 4, 5):
+        return 1  # spring
+    if month in (6, 7, 8):
+        return 2  # summer
+    return 3  # autumn
 
 
 def query_influx_frame(
@@ -139,13 +157,36 @@ def fetch_weather(client: InfluxDBClient, config: LoadForecastConfig, *, start: 
         fields=["temp_air", "ghi", "dni", "dhi", "wind_speed"],
         start=start,
         stop=stop,
-        site=config.site,
+        site=None,
     )
     if weather.empty:
         raise RuntimeError("No weather data returned from Influx. Run ingest first.")
     weather = weather.rename(columns={"temp_air": "Temperature"})
     weather = weather.sort_index().asfreq("30min", method="pad")
     return weather
+
+
+def fetch_netload(
+    client: InfluxDBClient,
+    config: LoadForecastConfig,
+    *,
+    start: pd.Timestamp,
+    stop: pd.Timestamp,
+) -> pd.Series:
+    history = query_influx_frame(
+        client,
+        config.influx_bucket,
+        config.actual_measurement,
+        fields=["netload_kw"],
+        start=start,
+        stop=stop,
+        site=config.site,
+    )
+    if history.empty:
+        raise RuntimeError("No historical netload data available; cannot build lag features")
+    history = history.sort_index().asfreq("30min")
+    history = history.ffill().bfill()
+    return history["netload_kw"].astype(float)
 
 
 def engineer_features(df: pd.DataFrame, *, dropna: bool = False) -> pd.DataFrame:
@@ -160,6 +201,8 @@ def engineer_features(df: pd.DataFrame, *, dropna: bool = False) -> pd.DataFrame
     df_feat["is_holiday"] = df_feat["timestamp"].apply(lambda x: 1 if jpholiday.is_holiday(x) else 0)
     df_feat["is_business_hour"] = ((df_feat["hour"] >= 8) & (df_feat["hour"] <= 22)).astype(int)
     df_feat["time_frame"] = df_feat["hour"] * 2 + (df_feat["timestamp"].dt.minute // 30) + 1
+    df_feat["week_of_year"] = df_feat["timestamp"].dt.isocalendar().week.astype(int)
+    df_feat["season"] = df_feat["month"].apply(_calculate_season)
 
     df_feat["temp_business_hr"] = df_feat["Temperature"] * df_feat["is_business_hour"]
     df_feat["temp_lag_1_day"] = (
@@ -195,8 +238,10 @@ def engineer_features(df: pd.DataFrame, *, dropna: bool = False) -> pd.DataFrame
     df_feat["month_sin"] = np.sin(2 * np.pi * df_feat["month"] / 12)
     df_feat["month_cos"] = np.cos(2 * np.pi * df_feat["month"] / 12)
 
-    keep_cols = set(FORECAST_FEATURES)
-    drop_cols = [col for col in df_feat.columns if col not in keep_cols and col != "timestamp"]
+    lag_features = {f"NETLOAD_lag_{lag}" for lag in NETLOAD_LAGS}
+    base_features = set(FORECAST_FEATURES) - lag_features
+    keep_cols = base_features | {"timestamp"}
+    drop_cols = [col for col in df_feat.columns if col not in keep_cols]
     df_feat = df_feat.drop(columns=drop_cols)
     df_feat = df_feat.set_index("timestamp").sort_index()
 
@@ -213,9 +258,12 @@ def predict_forecast(
     *,
     start_time: pd.Timestamp,
     horizon_steps: int,
+    netload_history: pd.Series,
 ) -> pd.DataFrame:
     if features.empty:
         raise RuntimeError("Feature frame is empty; cannot forecast")
+    if netload_history.empty:
+        raise RuntimeError("Netload history is empty; cannot compute lag features")
 
     future_rows = features[features.index >= start_time]
     if future_rows.empty:
@@ -227,13 +275,40 @@ def predict_forecast(
             horizon_steps,
             len(future_rows),
         )
-    predictions = model.predict(future_rows[FORECAST_FEATURES])
-    return pd.DataFrame(
-        {
-            "timestamp": future_rows.index,
-            "load_forecast_kw": predictions,
-        }
-    )
+    predictions: List[float] = []
+    prediction_index: List[pd.Timestamp] = []
+    history = netload_history.sort_index()
+    history = history.asfreq("30min")
+    history = history.ffill().bfill()
+    max_lag_steps = max(NETLOAD_LAGS)
+    last_required_timestamp = start_time - pd.Timedelta(minutes=30)
+    if history.index.empty or history.index.max() < last_required_timestamp:
+        raise RuntimeError("Netload history is stale; unable to seed lag features")
+    if len(history.dropna()) < max_lag_steps:
+        LOGGER.warning("Netload history shorter than required lags. Results may degrade.")
+
+    for timestamp, row in future_rows.iterrows():
+        feature_row = row.copy()
+        missing_lag = None
+        for lag in NETLOAD_LAGS:
+            lag_ts = timestamp - pd.Timedelta(minutes=30 * lag)
+            value = history.get(lag_ts, np.nan)
+            if pd.isna(value):
+                missing_lag = lag
+                break
+            feature_row[f"NETLOAD_lag_{lag}"] = float(value)
+        if missing_lag is not None:
+            raise RuntimeError(
+                f"Missing NETLOAD_lag_{missing_lag} data for timestamp {timestamp}. Ensure historical netload is available."
+            )
+        input_features = pd.DataFrame([feature_row.reindex(FORECAST_FEATURES)])
+        pred = float(model.predict(input_features)[0])
+        predictions.append(pred)
+        prediction_index.append(timestamp)
+        history.loc[timestamp] = pred
+        history = history.sort_index()
+
+    return pd.DataFrame({"timestamp": prediction_index, "load_forecast_kw": predictions})
 
 
 def write_forecasts(
@@ -276,6 +351,7 @@ def build_config_from_args(args: argparse.Namespace) -> LoadForecastConfig:
         horizon_hours=args.horizon_hours,
         history_hours=args.history_hours,
         weather_measurement=args.weather_measurement,
+        actual_measurement=args.actual_measurement,
         forecast_measurement=args.forecast_measurement,
         model_path=Path(args.model_path),
         influx_url=args.influx_url,
@@ -304,11 +380,15 @@ def run_forecast(config: LoadForecastConfig) -> int:
         weather_df = fetch_weather(client, config, start=history_start, stop=forecast_end)
         features = engineer_features(weather_df)
         horizon_steps = int(config.horizon_hours * 2)
+        lag_window = pd.Timedelta(minutes=30 * max(NETLOAD_LAGS))
+        netload_start = min(history_start, now - lag_window)
+        netload_history = fetch_netload(client, config, start=netload_start, stop=now)
         forecast_df = predict_forecast(
             model,
             features,
             start_time=now,
             horizon_steps=horizon_steps,
+            netload_history=netload_history,
         )
         tags = {"site": config.site, "model": config.model_path.stem}
         written = write_forecasts(
@@ -344,6 +424,11 @@ def parse_args() -> argparse.Namespace:
         "--weather-measurement",
         default=os.getenv("WEATHER_MEASUREMENT", "weather_forecast"),
         help="Measurement storing weather forecasts",
+    )
+    parser.add_argument(
+        "--actual-measurement",
+        default=os.getenv("HISTORICAL_MEASUREMENT", "historical_actuals"),
+        help="Measurement storing historical netload data",
     )
     parser.add_argument(
         "--forecast-measurement",

@@ -6,18 +6,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# Minimal runtime deps (no compilers needed for wheels)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    gcc \
-    libgomp1 \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+COPY requirements.weather.txt ./
 RUN pip install --upgrade pip setuptools wheel \
-    && pip install --no-cache-dir -r requirements.txt
+    && pip install --no-cache-dir -r requirements.weather.txt
 
 COPY app ./app
-COPY model ./model
-COPY historical_data ./historical_data
 
-CMD ["python", "app/scheduler.py"]
+CMD ["python", "app/scheduler.py", "--jobs", "weather_ingest"]

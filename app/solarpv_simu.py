@@ -128,7 +128,7 @@ def fetch_weather(
         fields=WEATHER_FIELDS,
         start=start,
         stop=stop,
-        site=config.site,
+        site=None,
     )
     if weather.empty:
         raise RuntimeError("No weather data available for PV simulation")
@@ -166,6 +166,17 @@ def build_location(config: SolarPVSimConfig) -> Location:
     )
 
 
+def _extract_mc_series(mc: ModelChain, attr: str, index: pd.DatetimeIndex) -> pd.Series:
+    value = getattr(mc, attr, None)
+    if value is None and hasattr(mc, "results"):
+        value = getattr(mc.results, attr, None)
+    if value is None:
+        raise RuntimeError(f"pvlib ModelChain did not produce '{attr}' results")
+    if isinstance(value, pd.Series):
+        return value
+    return pd.Series(value, index=index)
+
+
 def simulate_pv_power(
     system: PVSystem,
     location: Location,
@@ -175,11 +186,12 @@ def simulate_pv_power(
         raise RuntimeError("pvlib is required for PV simulation")
     mc = ModelChain(system, location, aoi_model='physical', spectral_model='no_loss', losses_model='pvwatts')
     mc.run_model(weather)
-    ac = mc.ac if isinstance(mc.ac, pd.Series) else pd.Series(mc.ac, index=weather.index)
-    dc = mc.dc if isinstance(mc.dc, pd.Series) else pd.Series(mc.dc, index=weather.index)
+    ac = _extract_mc_series(mc, "ac", weather.index)
+    dc = _extract_mc_series(mc, "dc", weather.index)
     df = pd.DataFrame(
         {
             "solarpv_forecast_kw": ac.astype(float) / 1000.0,
+            "solarpv_dc_kw": dc.astype(float) / 1000.0,
         },
         index=weather.index,
     )
@@ -212,6 +224,8 @@ def write_forecasts(
             .field("solarpv_forecast_kw", float(row["solarpv_forecast_kw"]))
             .field("issued_at", issued_at.isoformat())
         )
+        if "solarpv_dc_kw" in row.index and pd.notna(row["solarpv_dc_kw"]):
+            point = point.field("solarpv_dc_kw", float(row["solarpv_dc_kw"]))
         for key, value in tags.items():
             if value is None:
                 continue

@@ -1,37 +1,15 @@
-"""Lightweight sequential scheduler for EPC1522 demo agents.
-
-The scheduler pulls configuration from environment variables (see `.env`) and
-runs the weather ingestion, load forecast, and PV simulation jobs in order.
-"""
+"""Python scheduler for EPC1522 agents with independent intervals per job."""
 from __future__ import annotations
 
 import argparse
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Sequence, Tuple
-
-from evaluation import EvaluationConfig, run_evaluation
-from ingest_weather import WeatherIngestConfig, run_ingest
-from load_forecast import LoadForecastConfig, run_forecast
-from solarpv_simu import SolarPVSimConfig, run_simulation
+from typing import Callable, Dict, List, Sequence
 
 LOGGER = logging.getLogger("scheduler")
-
-
-@dataclass
-class SchedulerConfig:
-    interval_minutes: int
-    run_once: bool
-    initial_delay_seconds: int
-    evaluation_interval_minutes: int
-
-
-@dataclass
-class SchedulerState:
-    last_evaluation_epoch: float | None = None
 
 
 def _to_bool(value: str | None, default: bool = False) -> bool:
@@ -55,28 +33,37 @@ def _env_str(name: str, default: str) -> str:
     return value if value is not None else default
 
 
-def build_weather_config_from_env() -> WeatherIngestConfig:
-    return WeatherIngestConfig(
-        latitude=_env_float("SITE_LATITUDE", 0.0),
-        longitude=_env_float("SITE_LONGITUDE", 0.0),
-        hours=_env_int("FORECAST_HOURS", 48),
-        site=_env_str("SITE_NAME", "default"),
-        model=_env_str("OPEN_METEO_MODEL", "best_match"),
-        measurement=_env_str("WEATHER_MEASUREMENT", "weather_forecast"),
-        influx_url=_env_str("INFLUX_URL", ""),
-        influx_token=_env_str("INFLUX_TOKEN", ""),
-        influx_org=_env_str("INFLUX_ORG", ""),
-        influx_bucket=_env_str("INFLUX_BUCKET", ""),
-        verify_ssl=_to_bool(os.getenv("INFLUX_VERIFY_SSL"), True),
-    )
+@dataclass
+class SchedulerConfig:
+    poll_seconds: int
+    run_once: bool
+    initial_delay_seconds: int
+    job_names: Sequence[str] = field(default_factory=list)
 
 
-def build_load_config_from_env() -> LoadForecastConfig:
+@dataclass
+class ScheduledJob:
+    name: str
+    interval_minutes: int
+    runner: Callable[[], None]
+    last_run_epoch: float | None = None
+
+    def is_due(self, now: float) -> bool:
+        if self.interval_minutes <= 0:
+            return False
+        if self.last_run_epoch is None:
+            return True
+        return now - self.last_run_epoch >= self.interval_minutes * 60
+
+
+def build_load_config_from_env():
+    from load_forecast import LoadForecastConfig  # lazy import
     return LoadForecastConfig(
         site=_env_str("SITE_NAME", "default"),
         horizon_hours=_env_int("LOAD_FORECAST_HOURS", 24),
         history_hours=_env_int("LOAD_HISTORY_HOURS", 72),
         weather_measurement=_env_str("WEATHER_MEASUREMENT", "weather_forecast"),
+        actual_measurement=_env_str("HISTORICAL_MEASUREMENT", "historical_actuals"),
         forecast_measurement=_env_str("FORECAST_MEASUREMENT", "forecasts"),
         model_path=Path(_env_str("LOAD_MODEL_PATH", "model/xgb_model.pkl")),
         influx_url=_env_str("INFLUX_URL", ""),
@@ -87,7 +74,8 @@ def build_load_config_from_env() -> LoadForecastConfig:
     )
 
 
-def build_pv_config_from_env() -> SolarPVSimConfig:
+def build_pv_config_from_env():
+    from solarpv_simu import SolarPVSimConfig  # lazy import
     return SolarPVSimConfig(
         site=_env_str("SITE_NAME", "default"),
         horizon_hours=_env_int("PV_FORECAST_HOURS", 24),
@@ -111,7 +99,9 @@ def build_pv_config_from_env() -> SolarPVSimConfig:
         model_name=_env_str("PV_MODEL_NAME", "pvlib_pvwatts"),
     )
 
-def build_evaluation_config_from_env() -> EvaluationConfig:
+
+def build_evaluation_config_from_env():
+    from evaluation import EvaluationConfig  # lazy import
     return EvaluationConfig(
         site=_env_str("SITE_NAME", "default"),
         window_hours=_env_int("EVALUATION_WINDOW_HOURS", 24),
@@ -127,129 +117,152 @@ def build_evaluation_config_from_env() -> EvaluationConfig:
 
 
 def run_weather_job() -> None:
-    config = build_weather_config_from_env()
-    run_ingest(config)
+    # Import inside the function so weather container doesn't need heavy deps
+    import ingest_weather  # lazy import
+    ingest_weather.main()
 
 
 def run_load_job() -> None:
-    config = build_load_config_from_env()
-    run_forecast(config)
+    from load_forecast import run_forecast  # lazy import
+    run_forecast(build_load_config_from_env())
 
 
 def run_pv_job() -> None:
-    config = build_pv_config_from_env()
-    run_simulation(config)
+    from solarpv_simu import run_simulation  # lazy import
+    run_simulation(build_pv_config_from_env())
+
 
 def run_evaluation_job() -> None:
-    config = build_evaluation_config_from_env()
-    run_evaluation(config)
+    from evaluation import run_evaluation  # lazy import
+    run_evaluation(build_evaluation_config_from_env())
 
-def execute_cycle(state: SchedulerState, evaluation_interval_minutes: int) -> None:
-    jobs: Sequence[Tuple[str, Callable[[], None]]] = (
-        ("weather_ingest", run_weather_job),
-        ("load_forecast", run_load_job),
-        ("pv_simulation", run_pv_job),
-    )
-    for name, job in jobs:
-        LOGGER.info("Starting job: %s", name)
-        try:
-            job()
-            LOGGER.info("Job succeeded: %s", name)
-        except Exception:
-            LOGGER.exception("Job failed: %s", name)
-    if should_run_evaluation(state, evaluation_interval_minutes):
-        LOGGER.info("Starting job: evaluation")
-        try:
-            run_evaluation_job()
-            state.last_evaluation_epoch = time.time()
-            LOGGER.info("Job succeeded: evaluation")
-        except Exception:
-            LOGGER.exception("Job failed: evaluation")
+
+def build_job_definitions() -> Dict[str, ScheduledJob]:
+    return {
+        "weather_ingest": ScheduledJob(
+            name="weather_ingest",
+            interval_minutes=_env_int("WEATHER_INTERVAL_MINUTES", 180),
+            runner=run_weather_job,
+        ),
+        "load_forecast": ScheduledJob(
+            name="load_forecast",
+            interval_minutes=_env_int("LOAD_INTERVAL_MINUTES", 60),
+            runner=run_load_job,
+        ),
+        "pv_simulation": ScheduledJob(
+            name="pv_simulation",
+            interval_minutes=_env_int("PV_INTERVAL_MINUTES", 60),
+            runner=run_pv_job,
+        ),
+        "evaluation": ScheduledJob(
+            name="evaluation",
+            interval_minutes=_env_int("EVALUATION_INTERVAL_MINUTES", 24 * 60),
+            runner=run_evaluation_job,
+        ),
+    }
+
+
+def select_jobs(requested: Sequence[str]) -> List[ScheduledJob]:
+    definitions = build_job_definitions()
+    jobs: List[ScheduledJob] = []
+    for name in requested:
+        job = definitions.get(name.strip())
+        if job is None:
+            LOGGER.warning("Unknown job requested: %s", name)
+            continue
+        if job.interval_minutes <= 0:
+            LOGGER.info("Job %s disabled via interval %s", job.name, job.interval_minutes)
+            continue
+        jobs.append(job)
+    return jobs
+
+
+def run_job(job: ScheduledJob) -> None:
+    LOGGER.info("Starting job: %s", job.name)
+    try:
+        job.runner()
+        LOGGER.info("Job succeeded: %s", job.name)
+    except Exception:
+        LOGGER.exception("Job failed: %s", job.name)
+    finally:
+        job.last_run_epoch = time.time()
 
 
 def parse_args() -> SchedulerConfig:
-    parser = argparse.ArgumentParser(description="Sequential scheduler for EPC1522 demo")
+    parser = argparse.ArgumentParser(description="Independent scheduler for EPC1522 agents")
     parser.add_argument(
-        "--interval-minutes",
+        "--poll-seconds",
         type=int,
-        default=_env_int("SCHEDULE_INTERVAL_MINUTES", 30),
-        help="Minutes between scheduler cycles",
+        default=_env_int("SCHEDULER_POLL_SECONDS", 60),
+        help="Seconds between checks for due jobs",
     )
     parser.add_argument(
         "--run-once",
         action="store_true",
         default=_to_bool(os.getenv("SCHEDULER_RUN_ONCE"), False),
-        help="Run a single cycle instead of looping",
+        help="Execute each enabled job once and exit",
     )
     parser.add_argument(
         "--initial-delay",
         type=int,
         default=_env_int("SCHEDULER_INITIAL_DELAY_SECONDS", 0),
-        help="Seconds to sleep before first cycle",
+        help="Seconds to wait before starting the scheduler loop",
     )
     parser.add_argument(
-        "--evaluation-interval-minutes",
-        type=int,
-        default=_env_int("EVALUATION_INTERVAL_MINUTES", 24 * 60),
-        help="Minutes between evaluation job executions",
+        "--jobs",
+        default=_env_str(
+            "SCHEDULER_JOBS",
+            "weather_ingest,load_forecast,pv_simulation,evaluation",
+        ),
+        help="Comma-separated list of jobs to run",
     )
     parser.add_argument(
         "--log-level",
         default=_env_str("LOG_LEVEL", "INFO"),
-        help="Logging level",
+        help="Logging level (default INFO)",
     )
     args = parser.parse_args()
     logging.basicConfig(
         level=args.log_level.upper(),
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
+    job_names = [name.strip() for name in args.jobs.split(",") if name.strip()]
     return SchedulerConfig(
-        interval_minutes=args.interval_minutes,
+        poll_seconds=max(args.poll_seconds, 5),
         run_once=args.run_once,
-        initial_delay_seconds=args.initial_delay,
-        evaluation_interval_minutes=args.evaluation_interval_minutes,
+        initial_delay_seconds=max(args.initial_delay, 0),
+        job_names=job_names,
     )
 
 
-def should_run_evaluation(state: SchedulerState, interval_minutes: int) -> bool:
-    if interval_minutes <= 0:
-        return False
-    now = time.time()
-    if state.last_evaluation_epoch is None:
-        return True
-    return now - state.last_evaluation_epoch >= interval_minutes * 60
+def run_scheduler(config: SchedulerConfig) -> None:
+    jobs = select_jobs(config.job_names)
+    if not jobs:
+        LOGGER.warning("No jobs enabled. Scheduler exiting.")
+        return
+
+    if config.initial_delay_seconds:
+        LOGGER.info("Sleeping %s seconds before starting jobs", config.initial_delay_seconds)
+        time.sleep(config.initial_delay_seconds)
+
+    completed: set[str] = set()
+    while True:
+        now = time.time()
+        for job in jobs:
+            if job.is_due(now):
+                run_job(job)
+                if config.run_once:
+                    completed.add(job.name)
+        if config.run_once and completed == {job.name for job in jobs}:
+            LOGGER.info("run-once mode complete; exiting")
+            break
+        time.sleep(config.poll_seconds)
 
 
 def main() -> None:
     config = parse_args()
-    state = SchedulerState()
-    if config.initial_delay_seconds:
-        LOGGER.info("Sleeping %s seconds before first run", config.initial_delay_seconds)
-        time.sleep(config.initial_delay_seconds)
-
-    while True:
-        LOGGER.info("Running scheduled cycle")
-        execute_cycle(state, config.evaluation_interval_minutes)
-        if config.run_once:
-            break
-        LOGGER.info(
-            "Sleeping %s minutes before next cycle", config.interval_minutes
-        )
-        time.sleep(config.interval_minutes * 60)
+    run_scheduler(config)
 
 
 if __name__ == "__main__":
     main()
-def build_evaluation_config_from_env() -> EvaluationConfig:
-    return EvaluationConfig(
-        site=_env_str("SITE_NAME", "default"),
-        window_hours=_env_int("EVALUATION_WINDOW_HOURS", 24),
-        actual_measurement=_env_str("HISTORICAL_MEASUREMENT", "historical_actuals"),
-        forecast_measurement=_env_str("FORECAST_MEASUREMENT", "forecasts"),
-        evaluation_measurement=_env_str("EVALUATION_MEASUREMENT", "evaluations"),
-        influx_url=_env_str("INFLUX_URL", ""),
-        influx_token=_env_str("INFLUX_TOKEN", ""),
-        influx_org=_env_str("INFLUX_ORG", ""),
-        influx_bucket=_env_str("INFLUX_BUCKET", ""),
-        verify_ssl=_to_bool(os.getenv("INFLUX_VERIFY_SSL"), True),
-    )
