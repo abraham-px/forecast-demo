@@ -13,6 +13,7 @@ from influxdb_client.client.write_api import SYNCHRONOUS
 
 LOG = logging.getLogger("ingest_weather")
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 HOURLY_FIELDS: Dict[str, str] = {
     "temperature_2m": "temp_air",
     "wind_speed_10m": "wind_speed",
@@ -49,39 +50,89 @@ def get_config() -> Dict[str, str]:
     return config
 
 
-def fetch_forecast(config: Dict[str, str]) -> pd.DataFrame:
-    params = {
-        "latitude": float(config["latitude"]),
-        "longitude": float(config["longitude"]),
-        "hourly": list(HOURLY_FIELDS.keys()),
-        "models": config["model"],
-        "timezone": config["timezone"],
-        "forecast_days": 2,
-    }
-    LOG.info("Requesting Open-Meteo data for (%s,%s)", params["latitude"], params["longitude"])
-    response = requests.get(OPEN_METEO_URL, params=params, timeout=30)
-    response.raise_for_status()
-    raw = response.json().get("hourly")
-    if not raw:
-        raise RuntimeError("Open-Meteo response missing hourly block")
-
-    frame = pd.DataFrame(raw)
-    frame["time"] = pd.to_datetime(frame["time"], utc=True)
-    frame = frame.set_index("time")[list(HOURLY_FIELDS.keys())]
-    frame = frame.rename(columns=HOURLY_FIELDS).sort_index()
-
+def _compute_window(config: Dict[str, str]) -> tuple[datetime, datetime, bool]:
+    """Return (window_start_utc, window_end_utc, use_archive)."""
+    now_utc = datetime.now(tz=timezone.utc)
     start_override = config.get("start_date")
     if start_override:
         ts = pd.Timestamp(start_override)
         if ts.tzinfo is None:
-            ts = ts.tz_localize(config["timezone"])
+            ts = ts.tz_localize(config["timezone"])  # local date/time
         else:
-            ts = ts.tz_convert(config["timezone"])
-        window_start = ts.tz_convert(timezone.utc)
+            ts = ts.tz_convert(config["timezone"])  # normalize to local tz
+        window_start = ts.tz_convert(timezone.utc).to_pydatetime()
     else:
-        window_start = datetime.now(tz=timezone.utc)
+        window_start = now_utc
     window_end = window_start + timedelta(hours=FORECAST_HOURS)
-    frame = frame[(frame.index >= window_start) & (frame.index <= window_end)]
+    use_archive = start_override is not None and window_end <= now_utc
+    return window_start, window_end, use_archive
+
+
+def _request_json(url: str, params: dict) -> dict:
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def fetch_forecast(config: Dict[str, str]) -> pd.DataFrame:
+    window_start, window_end, use_archive = _compute_window(config)
+
+    if use_archive:
+        # Historical day via archive API
+        params = {
+            "latitude": float(config["latitude"]),
+            "longitude": float(config["longitude"]),
+            "hourly": list(HOURLY_FIELDS.keys()),
+            "start_date": window_start.date().isoformat(),
+            "end_date": window_end.date().isoformat(),
+            "timezone": "UTC",
+        }
+        LOG.info(
+            "Requesting Open-Meteo archive for (%s,%s) start=%s end=%s",
+            params["latitude"],
+            params["longitude"],
+            params["start_date"],
+            params["end_date"],
+        )
+        payload = _request_json(OPEN_METEO_ARCHIVE_URL, params)
+    else:
+        # Live forecast
+        params = {
+            "latitude": float(config["latitude"]),
+            "longitude": float(config["longitude"]),
+            "hourly": list(HOURLY_FIELDS.keys()),
+            "models": config["model"],
+            "timezone": "UTC",
+            "forecast_days": 2,
+        }
+        LOG.info(
+            "Requesting Open-Meteo forecast for (%s,%s) start=%s horizon=%sh",
+            params["latitude"],
+            params["longitude"],
+            window_start.isoformat(),
+            FORECAST_HOURS,
+        )
+        payload = _request_json(OPEN_METEO_URL, params)
+
+    hourly = payload.get("hourly")
+    if not hourly:
+        LOG.warning("Open-Meteo response missing or empty 'hourly' block")
+        return pd.DataFrame()
+
+    frame = pd.DataFrame(hourly)
+    if "time" not in frame.columns:
+        LOG.warning("Open-Meteo hourly payload missing 'time' column")
+        return pd.DataFrame()
+    frame["time"] = pd.to_datetime(frame["time"], utc=True)
+    frame = frame.set_index("time")[list(HOURLY_FIELDS.keys())]
+    frame = frame.rename(columns=HOURLY_FIELDS).sort_index()
+
+    # Trim to requested window and upsample to 30 min
+    mask = (frame.index >= window_start) & (frame.index <= window_end)
+    frame = frame.loc[mask]
+    if frame.empty:
+        LOG.warning("No rows found in the requested window")
+        return frame
     frame = frame.resample("30min").interpolate("time").ffill().bfill()
     return frame.iloc[:HALF_HOURLY_POINTS]
 
