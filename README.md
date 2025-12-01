@@ -1,33 +1,32 @@
 ## EPC1522 Load & PV Forecasting Demo
 
-This repository packages a lightweight end-to-end forecasting demo for an EPC1522
-running Portainer-managed containers. The container hosts three agents plus a
-simple scheduler:
+This repository packages a lightweight end‑to‑end forecasting demo for an EPC1522
+running Portainer‑managed containers. The stack runs independent agents on their
+own schedules via a simple Python scheduler:
 
-1. **Weather ingestion** (`app/ingest_weather.py`) pulls Open-Meteo data, resamples
-   it to 30-minute cadence, and writes to InfluxDB (`weather_forecast` measurement).
-2. **Load forecaster** (`app/load_forecast.py`) loads the pre-trained XGBoost model,
-   builds the same non-autoregressive feature set used in the notebook, and writes
-   48 half-hour load forecasts (24 h horizon) to Influx (`forecasts` measurement,
-   `load_forecast_kw` field).
-3. **PV simulation** (`app/solarpv_simu.py`) uses pvlib to convert the weather rows
-   into AC PV power forecasts at the same 30 min cadence, storing the output as
-   `solarpv_forecast_kw`.
-4. **Evaluation** (`app/evaluation.py`) compares the last 24h (configurable) of
-   forecasts vs. historical data, computes MAE/RMSE/MAPE via scikit-learn, and
-   writes accuracy metrics to the `evaluations` measurement once per day.
+1. **Weather ingestion** (`app/ingest_weather.py`) pulls Open‑Meteo data, aligns it
+   to 30‑minute cadence, and writes to InfluxDB (`weather_forecast`). Horizon is
+   configurable via `FORECAST_HOURS` (default 48h) to cover multiple PV/load cycles.
+2. **PV simulation** (`app/solarpv_simu.py`) uses pvlib’s ModelChain to convert the
+   weather rows into AC PV power forecasts at 30‑minute cadence, writing
+   `solarpv_forecast_kw` to `forecasts` (24h horizon by default).
+3. **Load forecaster** (`app/load_forecast.py`) (optional) writes 24h load forecasts
+   to `forecasts`. You can disable it during testing.
+4. **Evaluation** (`app/evaluation.py`) (optional) computes daily accuracy metrics.
 
-The `app/scheduler.py` module invokes those jobs sequentially on an interval
-defined in `.env`, so a single container can manage the entire pipeline.
+The `app/scheduler.py` module triggers jobs independently using per‑job intervals
+from `.env` (`WEATHER/LOAD/PV_INTERVAL_MINUTES`).
 
 
 ### Contents
 
-- `app/`: agents, scheduler, and the one-off historical backfill script
-- `historical_data/`: CSVs for seeding the `historical_actuals` measurement
+- `app/`: agents and the scheduler
 - `model/xgb_model.pkl`: serialized load model artifact
-- `AGENTS.md`: role definitions and data contracts
+- `AGENTS.md`: contributor and agent guidelines
 - `.env`: editable config consumed by every module
+ - `dockerfile.weather`: minimal image for weather ingest
+ - `dockerfile.forecast`: full image for PV/load/evaluation
+ - `requirements.weather.txt`: minimal deps for ingest
 
 
 ## Prerequisites
@@ -40,10 +39,13 @@ defined in `.env`, so a single container can manage the entire pipeline.
 
 ### Python Dependencies
 
-`requirements.txt` specifies the exact versions installed in the container:
+`requirements.txt` specifies the exact versions installed in the forecast container:
 `numpy`, `pandas`, `requests`, `influxdb-client`, `jpholiday`, `joblib`,
 `pvlib`, `xgboost`, etc. These are installed automatically during the Docker
 build phase.
+
+`requirements.weather.txt` contains a minimal set for the ingest container
+(`influxdb-client`, `pandas`, `requests`).
 
 
 ## Configuration (`.env`)
@@ -68,34 +70,34 @@ All runtime parameters flow through `.env`; key entries:
 ## Build & Run
 
 ```bash
-docker compose up --build -d
+# build split images
+docker compose build --no-cache weather-ingest forecast-agents
+
+# run only ingest + PV
+docker compose up -d weather-ingest forecast-agents
 ```
 
-This command builds `forecast-agents` (see `dockercompose.yml`), injects `.env`,
-mounts `./model` for easy artifact updates, and starts the scheduler service
-(`python app/scheduler.py`). Logs show each job being executed in turn.
+Logs show each job when due based on intervals. To run single jobs:
+
+```bash
+docker compose run --rm weather-ingest python app/ingest_weather.py
+docker compose run --rm forecast-agents python app/scheduler.py --jobs pv_simulation --run-once
+```
 
 ### Stopping / restarting
 
 ```bash
-docker compose stop
-docker compose start
+docker compose stop weather-ingest forecast-agents
+docker compose start weather-ingest forecast-agents
 ```
 
 
-## Backfilling Historical Data
+## Start Dates (Backfill)
 
-Before running forecasts, populate `historical_actuals` so evaluation dashboards
-and manual checks have context. The repository includes
-`historical_data/technos-1118.csv` and a helper script:
-
-```bash
-docker compose run --rm forecast-agents \
-  python app/backfill_historical.py --csv-path historical_data/technos-1118.csv
-```
-
-Environment variables (`HISTORICAL_MEASUREMENT`, `SITE_NAME`, etc.) are honored by
-the script, so no extra flags are needed unless you point to a different file.
+Set `START_DATE=YYYY-MM-DD` (or ISO datetime) in `.env` to backfill ingest for a
+fixed window. The script automatically uses Open‑Meteo’s archive API when the
+entire window is in the past. `PV_START_DATE` can be set separately for PV;
+otherwise it falls back to `START_DATE`.
 
 
 ## Manual Agent Runs
@@ -103,9 +105,8 @@ the script, so no extra flags are needed unless you point to a different file.
 You can invoke any agent directly inside the container for troubleshooting:
 
 ```bash
-docker compose exec forecast-agents python app/ingest_weather.py --latitude ... --longitude ...
-docker compose exec forecast-agents python app/load_forecast.py --run-once  # default horizon
-docker compose exec forecast-agents python app/solarpv_simu.py
+docker compose run --rm weather-ingest python app/ingest_weather.py
+docker compose run --rm forecast-agents python app/solarpv_simu.py
 ```
 
 Most options are already defined in `.env`, so flags are only necessary when
@@ -114,13 +115,13 @@ overriding defaults.
 
 ## Verifying the Demo
 
-1. **Backfill** historical data (optional but recommended).
-2. **Start** the stack via `docker compose up`.
-3. **Monitor logs**: `docker compose logs -f forecast-agents`.
-4. **Inspect InfluxDB** measurements: confirm new rows in
-   `weather_forecast`, `forecasts`, `historical_actuals`.
-5. **Adjust schedules** via `.env` and restart the container if needed.
+1. Optionally set `START_DATE`/`PV_START_DATE` for deterministic windows.
+2. Start services: `docker compose up -d weather-ingest forecast-agents`.
+3. Monitor logs: `docker compose logs -f weather-ingest forecast-agents`.
+4. Inspect InfluxDB measurements: confirm new rows in `weather_forecast` and
+   `forecasts` (`solarpv_forecast_kw`).
+5. Adjust intervals via `.env` and restart services if needed.
 
-The demo is now ready to clone on the EPC device, configure through Portainer,
-and showcase fully automated load + PV forecasting. Adjust the `.env` file to
-match other sites or Influx targets without touching the source code.
+The demo is ready to clone on the EPC device, configure through Portainer, and
+showcase automated weather ingest + PV forecasting (load/evaluation optional).
+Tune `.env` to change intervals and horizons without code changes.
