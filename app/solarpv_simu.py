@@ -133,17 +133,21 @@ def fetch_weather(
     start: pd.Timestamp,
     stop: pd.Timestamp,
 ) -> pd.DataFrame:
+    # Pad the query window slightly to tolerate ingest alignment differences
+    pad = pd.Timedelta(minutes=60)
     weather = query_influx_frame(
         client,
         config.influx_bucket,
         config.weather_measurement,
         fields=WEATHER_FIELDS,
-        start=start,
-        stop=stop,
+        start=start - pad,
+        stop=stop + pad,
         site=None,
     )
     if weather.empty:
         raise RuntimeError("No weather data available for PV simulation")
+    # Restrict to the exact window after padding
+    weather = weather[(weather.index >= start) & (weather.index <= stop)]
     # Align to 30-minute steps and keep only 48 rows
     weather = weather.sort_index().asfreq("30min")
     weather = weather.ffill().bfill()

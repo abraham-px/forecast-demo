@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime, timedelta, timezone
+import math
 from typing import Dict
 
 import pandas as pd
@@ -21,13 +22,11 @@ HOURLY_FIELDS: Dict[str, str] = {
     "direct_normal_irradiance": "dni",
     "diffuse_radiation": "dhi",
 }
-FORECAST_HOURS = os.getenv("FORECAST_HOURS")
-if FORECAST_HOURS is None:
-    FORECAST_HOURS = 47
-else:
-    FORECAST_HOURS = int(FORECAST_HOURS)
-
-HALF_HOURLY_POINTS = FORECAST_HOURS * 2 + 1
+# Always produce a 24h, half-hourly window (48 rows)
+# Ingest horizon (hours) — should exceed PV/load 24h horizon
+FORECAST_HOURS = int(os.getenv("FORECAST_HOURS", "48"))
+# Exactly two points per hour at 30-minute resolution
+HALF_HOURLY_POINTS = FORECAST_HOURS * 2
 
 
 def get_config() -> Dict[str, str]:
@@ -103,7 +102,7 @@ def fetch_forecast(config: Dict[str, str]) -> pd.DataFrame:
             "hourly": list(HOURLY_FIELDS.keys()),
             "models": config["model"],
             "timezone": "UTC",
-            "forecast_days": 2,
+            "forecast_days": max(1, math.ceil(FORECAST_HOURS / 24)),
         }
         LOG.info(
             "Requesting Open-Meteo forecast for (%s,%s) start=%s horizon=%sh",
@@ -128,7 +127,8 @@ def fetch_forecast(config: Dict[str, str]) -> pd.DataFrame:
     frame = frame.rename(columns=HOURLY_FIELDS).sort_index()
 
     # Trim to requested window and upsample to 30 min
-    mask = (frame.index >= window_start) & (frame.index <= window_end)
+    # Select [start, end) to yield an exact multiple of 30-minute steps
+    mask = (frame.index >= window_start) & (frame.index < window_end)
     frame = frame.loc[mask]
     if frame.empty:
         LOG.warning("No rows found in the requested window")
