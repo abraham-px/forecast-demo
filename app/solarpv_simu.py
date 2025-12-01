@@ -35,6 +35,7 @@ except ImportError:
 
 LOGGER = logging.getLogger("solarpv_simu")
 WEATHER_FIELDS = ["ghi", "dni", "dhi", "temp_air", "wind_speed"]
+HALF_HOURLY_POINTS = 48  # 24h at 30-minute cadence
 
 
 @dataclass
@@ -114,6 +115,17 @@ from(bucket: \"{bucket}\")
     return frames
 
 
+def _resolve_start(ts_env: Optional[str], tz: str) -> pd.Timestamp:
+    if ts_env:
+        ts = pd.Timestamp(ts_env)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(tz)
+        else:
+            ts = ts.tz_convert(tz)
+        return ts.tz_convert("UTC")
+    return pd.Timestamp.now(tz="UTC")
+
+
 def fetch_weather(
     client: InfluxDBClient,
     config: SolarPVSimConfig,
@@ -132,9 +144,10 @@ def fetch_weather(
     )
     if weather.empty:
         raise RuntimeError("No weather data available for PV simulation")
-    weather = weather.tz_convert(config.timezone)
+    # Align to 30-minute steps and keep only 48 rows
+    weather = weather.sort_index().asfreq("30min")
     weather = weather.ffill().bfill()
-    return weather
+    return weather.iloc[:HALF_HOURLY_POINTS]
 
 
 def build_pv_system(config: SolarPVSimConfig) -> PVSystem:
@@ -215,14 +228,12 @@ def write_forecasts(
         return 0
 
     tags = tags or {}
-    issued_at = pd.Timestamp.now(tz="UTC")
     records = []
     for _, row in df.iterrows():
         point = (
             Point(measurement)
             .time(pd.Timestamp(row["timestamp"]).to_pydatetime(), WritePrecision.NS)
             .field("solarpv_forecast_kw", float(row["solarpv_forecast_kw"]))
-            .field("issued_at", issued_at.isoformat())
         )
         if "solarpv_dc_kw" in row.index and pd.notna(row["solarpv_dc_kw"]):
             point = point.field("solarpv_dc_kw", float(row["solarpv_dc_kw"]))
@@ -265,8 +276,10 @@ def build_config_from_args(args: argparse.Namespace) -> SolarPVSimConfig:
 def run_simulation(config: SolarPVSimConfig) -> int:
     if InfluxDBClient is None:
         raise RuntimeError("influxdb-client is required for PV simulation")
-    now = pd.Timestamp.now(tz="UTC")
-    horizon_end = now + pd.Timedelta(hours=config.horizon_hours)
+    # Determine window: 48 half-hour slots starting at now or override
+    start_override = os.getenv("PV_START_DATE") or os.getenv("START_DATE")
+    window_start = _resolve_start(start_override, config.timezone)
+    horizon_end = window_start + pd.Timedelta(minutes=30 * HALF_HOURLY_POINTS)
 
     with InfluxDBClient(
         url=config.influx_url,
@@ -274,12 +287,14 @@ def run_simulation(config: SolarPVSimConfig) -> int:
         org=config.influx_org,
         verify_ssl=config.verify_ssl,
     ) as client:
-        weather = fetch_weather(client, config, start=now, stop=horizon_end)
+        weather = fetch_weather(client, config, start=window_start, stop=horizon_end)
+        # Ensure pvlib gets local-time indexed weather
+        weather = weather.tz_convert(config.timezone)
         location = build_location(config)
         system = build_pv_system(config)
         pv_df = simulate_pv_power(system, location, weather)
-        pv_df = pv_df[pv_df["timestamp"] >= weather.index[0]]
-        tags = {"site": config.site, "model": config.model_name}
+        pv_df = pv_df.iloc[:HALF_HOURLY_POINTS]
+        tags = {"provider": "pvlib", "model": config.model_name}
         written = write_forecasts(
             pv_df,
             client=client,
