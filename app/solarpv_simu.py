@@ -1,7 +1,7 @@
 """Solar PV simulation agent for the EPC1522 demo.
 
 Reads the latest weather forecast from InfluxDB, runs a pvlib-based PV system
-simulation, and writes AC/DC forecasts into the shared `forecasts` measurement.
+simulation, and writes AC power forecasts into the shared `forecasts` measurement.
 """
 from __future__ import annotations
 
@@ -200,14 +200,7 @@ def simulate_pv_power(
     mc = ModelChain(system, location, aoi_model='physical', spectral_model='no_loss', losses_model='pvwatts')
     mc.run_model(weather)
     ac = _extract_mc_series(mc, "ac", weather.index)
-    dc = _extract_mc_series(mc, "dc", weather.index)
-    df = pd.DataFrame(
-        {
-            "solarpv_forecast_kw": ac.astype(float) / 1000.0,
-            "solarpv_dc_kw": dc.astype(float) / 1000.0,
-        },
-        index=weather.index,
-    )
+    df = pd.DataFrame({"solarpv_forecast_kw": ac.astype(float) / 1000.0}, index=weather.index)
     df = df.reset_index().rename(columns={"index": "timestamp"})
     return df
 
@@ -235,8 +228,6 @@ def write_forecasts(
             .time(pd.Timestamp(row["timestamp"]).to_pydatetime(), WritePrecision.NS)
             .field("solarpv_forecast_kw", float(row["solarpv_forecast_kw"]))
         )
-        if "solarpv_dc_kw" in row.index and pd.notna(row["solarpv_dc_kw"]):
-            point = point.field("solarpv_dc_kw", float(row["solarpv_dc_kw"]))
         for key, value in tags.items():
             if value is None:
                 continue
