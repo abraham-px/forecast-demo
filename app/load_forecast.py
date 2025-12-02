@@ -230,10 +230,11 @@ def engineer_features(df: pd.DataFrame, *, dropna: bool = False) -> pd.DataFrame
     df_feat = df_feat.drop(columns=drop_cols)
     df_feat = df_feat.set_index("timestamp").sort_index()
 
+    # Only enforce dropna when explicitly requested; otherwise fill forward/back.
     if dropna:
         df_feat = df_feat.dropna()
     else:
-        df_feat = df_feat.dropna(subset=["Temperature"])
+        df_feat = df_feat.ffill().bfill()
     return df_feat
 
 
