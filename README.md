@@ -4,15 +4,15 @@ This repository packages a lightweight end‑to‑end forecasting demo for an EP
 running Portainer‑managed containers. The stack runs independent agents on their
 own schedules via a simple Python scheduler:
 
-1. **Weather ingestion** (`app/ingest_weather.py`) pulls Open‑Meteo data, aligns it
-   to 30‑minute cadence, and writes to InfluxDB (`weather_forecast`). Horizon is
-   configurable via `FORECAST_HOURS` (default 48h) to cover multiple PV/load cycles.
-2. **PV simulation** (`app/solarpv_simu.py`) uses pvlib’s ModelChain to convert the
-   weather rows into AC PV power forecasts at 30‑minute cadence, writing
-   `solarpv_forecast_kw` to `forecasts` (24h horizon by default).
-3. **Load forecaster** (`app/load_forecast.py`) (optional) writes 24h load forecasts
-   to `forecasts`. You can disable it during testing.
-4. **Evaluation** (`app/evaluation.py`) (optional) computes daily accuracy metrics.
+1. **Weather ingest** (`app/ingest_weather.py`) pulls Open‑Meteo data every 3 h,
+   aligns it to 30‑minute cadence, and writes to `weather_forecast`. Horizon is
+   set via `FORECAST_HOURS` (default 48h) to cover multiple downstream cycles.
+2. **PV simulation** (`app/solarpv_simu.py`) runs pvlib ModelChain on those weather
+   rows and writes 24h of AC PV power (`solarpv_forecast_kw`) to `forecasts`.
+3. **Load forecaster** (`app/load_forecast.py`) now consumes only weather/time
+   features—no netload lags are required. By default it writes a 24h horizon to
+   `forecasts` using the bundled XGBoost model.
+4. **Evaluation** (`app/evaluation.py`) computes daily accuracy metrics (optional).
 
 The `app/scheduler.py` module triggers jobs independently using per‑job intervals
 from `.env` (`WEATHER/LOAD/PV_INTERVAL_MINUTES`).
@@ -44,8 +44,8 @@ from `.env` (`WEATHER/LOAD/PV_INTERVAL_MINUTES`).
 `pvlib`, `xgboost`, etc. These are installed automatically during the Docker
 build phase.
 
-`requirements.weather.txt` contains a minimal set for the ingest container
-(`influxdb-client`, `pandas`, `requests`).
+`requirements.weather.txt` contains the minimal ingest deps (`influxdb-client`,
+`pandas`, `requests`).
 
 
 ## Configuration (`.env`)
@@ -115,12 +115,13 @@ overriding defaults.
 
 ## Verifying the Demo
 
-1. Optionally set `START_DATE`/`PV_START_DATE` for deterministic windows.
+1. Optionally set `START_DATE`, `PV_START_DATE`, and `LOAD_FORECAST_HOURS` in `.env`
+   for deterministic windows.
 2. Start services: `docker compose up -d weather-ingest forecast-agents`.
 3. Monitor logs: `docker compose logs -f weather-ingest forecast-agents`.
-4. Inspect InfluxDB measurements: confirm new rows in `weather_forecast` and
-   `forecasts` (`solarpv_forecast_kw`).
-5. Adjust intervals via `.env` and restart services if needed.
+4. Inspect Influx: confirm rows in `weather_forecast` and `forecasts`
+   (`solarpv_forecast_kw`, `load_forecast_kw`).
+5. Adjust per-job intervals via `.env` and restart services if needed.
 
 The demo is ready to clone on the EPC device, configure through Portainer, and
 showcase automated weather ingest + PV forecasting (load/evaluation optional).

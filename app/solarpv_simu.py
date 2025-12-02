@@ -5,7 +5,6 @@ simulation, and writes AC power forecasts into the shared `forecasts` measuremen
 """
 from __future__ import annotations
 
-import argparse
 import logging
 import os
 from dataclasses import dataclass
@@ -40,7 +39,6 @@ HALF_HOURLY_POINTS = 48  # 24h at 30-minute cadence
 
 @dataclass
 class SolarPVSimConfig:
-    site: str
     horizon_hours: int
     weather_measurement: str
     forecast_measurement: str
@@ -60,6 +58,33 @@ class SolarPVSimConfig:
     gamma_pdc: float
     albedo: float
     model_name: str
+
+
+def build_config_from_env() -> SolarPVSimConfig:
+    return SolarPVSimConfig(
+        horizon_hours=int(os.getenv("PV_FORECAST_HOURS", "24")),
+        weather_measurement=os.getenv("WEATHER_MEASUREMENT", "weather_forecast"),
+        forecast_measurement=os.getenv("FORECAST_MEASUREMENT", "forecasts"),
+        influx_url=os.getenv("INFLUX_URL", ""),
+        influx_token=os.getenv("INFLUX_TOKEN", ""),
+        influx_org=os.getenv("INFLUX_ORG", ""),
+        influx_bucket=os.getenv("INFLUX_BUCKET", ""),
+        verify_ssl=(
+            str(os.getenv("INFLUX_VERIFY_SSL", "true")).lower()
+            in {"1", "true", "yes", "on"}
+        ),
+        latitude=float(os.getenv("SITE_LATITUDE", "0")),
+        longitude=float(os.getenv("SITE_LONGITUDE", "0")),
+        altitude=float(os.getenv("SITE_ALTITUDE", "0")),
+        timezone=os.getenv("SITE_TIMEZONE", "UTC"),
+        surface_tilt=float(os.getenv("PV_SURFACE_TILT", "20")),
+        surface_azimuth=float(os.getenv("PV_SURFACE_AZIMUTH", "180")),
+        dc_capacity_kw=float(os.getenv("PV_DC_CAPACITY_KW", "0")),
+        ac_capacity_kw=float(os.getenv("PV_AC_CAPACITY_KW", "0")),
+        gamma_pdc=float(os.getenv("PV_GAMMA_PDC", "-0.003")),
+        albedo=float(os.getenv("PV_ALBEDO", "0.2")),
+        model_name=os.getenv("PV_MODEL_NAME", "pvlib_pvwatts"),
+    )
 
 
 def configure_logging(level: str = "INFO") -> None:
@@ -135,6 +160,12 @@ def fetch_weather(
 ) -> pd.DataFrame:
     # Pad the query window slightly to tolerate ingest alignment differences
     pad = pd.Timedelta(minutes=60)
+    LOGGER.info(
+        "Fetching weather window UTC start=%s end=%s (pad=%s)",
+        start.isoformat(),
+        stop.isoformat(),
+        pad,
+    )
     weather = query_influx_frame(
         client,
         config.influx_bucket,
@@ -148,9 +179,20 @@ def fetch_weather(
         raise RuntimeError("No weather data available for PV simulation")
     # Restrict to the exact window after padding
     weather = weather[(weather.index >= start) & (weather.index <= stop)]
+    if weather.empty:
+        raise RuntimeError(
+            "Weather data missing after trimming to target window. "
+            "Run ingest first or adjust START_DATE/PV_START_DATE."
+        )
     # Align to 30-minute steps and keep only 48 rows
     weather = weather.sort_index().asfreq("30min")
     weather = weather.ffill().bfill()
+    LOGGER.info(
+        "Weather rows after trim/resample: %s (UTC %s -> %s)",
+        len(weather.index),
+        weather.index.min(),
+        weather.index.max(),
+    )
     return weather.iloc[:HALF_HOURLY_POINTS]
 
 
@@ -216,7 +258,6 @@ def write_forecasts(
     bucket: str,
     org: str,
     measurement: str,
-    tags: Optional[Dict[str, str]] = None,
 ) -> int:
     if InfluxDBClient is None or Point is None:
         raise RuntimeError("influxdb-client is required to write PV forecasts")
@@ -224,7 +265,6 @@ def write_forecasts(
         LOGGER.warning("PV simulation produced no rows")
         return 0
 
-    tags = tags or {}
     records = []
     for _, row in df.iterrows():
         point = (
@@ -232,40 +272,11 @@ def write_forecasts(
             .time(pd.Timestamp(row["timestamp"]).to_pydatetime(), WritePrecision.NS)
             .field("solarpv_forecast_kw", float(row["solarpv_forecast_kw"]))
         )
-        for key, value in tags.items():
-            if value is None:
-                continue
-            point = point.tag(key, value)
         records.append(point)
 
     write_api = client.write_api(write_options=SYNCHRONOUS)
     write_api.write(bucket=bucket, org=org, record=records)
     return len(records)
-
-
-def build_config_from_args(args: argparse.Namespace) -> SolarPVSimConfig:
-    return SolarPVSimConfig(
-        site=args.site,
-        horizon_hours=args.horizon_hours,
-        weather_measurement=args.weather_measurement,
-        forecast_measurement=args.forecast_measurement,
-        influx_url=args.influx_url,
-        influx_token=args.influx_token,
-        influx_org=args.influx_org,
-        influx_bucket=args.influx_bucket,
-        verify_ssl=args.verify_ssl,
-        latitude=args.latitude,
-        longitude=args.longitude,
-        altitude=args.altitude,
-        timezone=args.timezone,
-        surface_tilt=args.surface_tilt,
-        surface_azimuth=args.surface_azimuth,
-        dc_capacity_kw=args.dc_capacity_kw,
-        ac_capacity_kw=args.ac_capacity_kw,
-        gamma_pdc=args.gamma_pdc,
-        albedo=args.albedo,
-        model_name=args.model_name,
-    )
 
 
 def run_simulation(config: SolarPVSimConfig) -> int:
@@ -285,152 +296,31 @@ def run_simulation(config: SolarPVSimConfig) -> int:
         weather = fetch_weather(client, config, start=window_start, stop=horizon_end)
         # Ensure pvlib gets local-time indexed weather
         weather = weather.tz_convert(config.timezone)
+        LOGGER.info(
+            "PV window UTC %s -> %s | local %s -> %s",
+            window_start,
+            horizon_end,
+            weather.index.min(),
+            weather.index.max(),
+        )
         location = build_location(config)
         system = build_pv_system(config)
         pv_df = simulate_pv_power(system, location, weather)
         pv_df = pv_df.iloc[:HALF_HOURLY_POINTS]
-        tags = {"provider": "pvlib", "model": config.model_name}
         written = write_forecasts(
             pv_df,
             client=client,
             bucket=config.influx_bucket,
             org=config.influx_org,
             measurement=config.forecast_measurement,
-            tags=tags,
         )
         LOGGER.info("PV simulation wrote %s rows", written)
         return written
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run pvlib simulation and store forecasts")
-    parser.add_argument("--site", default=os.getenv("SITE_NAME", "default"), help="Site tag")
-    parser.add_argument(
-        "--horizon-hours",
-        type=int,
-        default=int(os.getenv("PV_FORECAST_HOURS", 24)),
-        dest="horizon_hours",
-        help="Forecast horizon in hours",
-    )
-    parser.add_argument(
-        "--weather-measurement",
-        default=os.getenv("WEATHER_MEASUREMENT", "weather_forecast"),
-        help="Measurement storing weather forecasts",
-    )
-    parser.add_argument(
-        "--forecast-measurement",
-        default=os.getenv("FORECAST_MEASUREMENT", "forecasts"),
-        help="Measurement where PV forecasts will be written",
-    )
-    parser.add_argument("--influx-url", default=os.getenv("INFLUX_URL"), help="InfluxDB URL")
-    parser.add_argument(
-        "--influx-token", default=os.getenv("INFLUX_TOKEN"), help="InfluxDB API token"
-    )
-    parser.add_argument(
-        "--influx-org", default=os.getenv("INFLUX_ORG"), help="InfluxDB organization"
-    )
-    parser.add_argument(
-        "--influx-bucket",
-        default=os.getenv("INFLUX_BUCKET", "AIML"),
-        help="InfluxDB bucket",)
-    parser.add_argument(
-        "--verify-ssl",
-        default=os.getenv("INFLUX_VERIFY_SSL", "true"),
-        type=lambda value: str(value).lower() in {"1", "true", "yes", "on"},
-        help="Toggle TLS verification",
-    )
-    parser.add_argument(
-        "--latitude",
-        type=float,
-        default=float(os.getenv("SITE_LATITUDE", 35.9801)),
-        help="PV site latitude",
-    )
-    parser.add_argument(
-        "--longitude",
-        type=float,
-        default=float(os.getenv("SITE_LONGITUDE", 139.8866)),
-        help="PV site longitude",
-    )
-    parser.add_argument(
-        "--altitude",
-        type=float,
-        default=float(os.getenv("SITE_ALTITUDE", 0)),
-        help="Site altitude in meters",
-    )
-    parser.add_argument(
-        "--timezone",
-        default=os.getenv("SITE_TIMEZONE", "Asia/Tokyo"),
-        help="IANA timezone string",
-    )
-    parser.add_argument(
-        "--surface-tilt",
-        type=float,
-        default=float(os.getenv("PV_SURFACE_TILT", 20)),
-        dest="surface_tilt",
-        help="Array tilt in degrees",
-    )
-    parser.add_argument(
-        "--surface-azimuth",
-        type=float,
-        default=float(os.getenv("PV_SURFACE_AZIMUTH", 180)),
-        dest="surface_azimuth",
-        help="Array azimuth in degrees",
-    )
-    parser.add_argument(
-        "--dc-capacity-kw",
-        type=float,
-        default=float(os.getenv("PV_DC_CAPACITY_KW", 165)),
-        dest="dc_capacity_kw",
-        help="Installed DC capacity in kW",
-    )
-    parser.add_argument(
-        "--ac-capacity-kw",
-        type=float,
-        default=float(os.getenv("PV_AC_CAPACITY_KW", 150)),
-        dest="ac_capacity_kw",
-        help="Inverter AC capacity in kW",
-    )
-    parser.add_argument(
-        "--gamma-pdc",
-        type=float,
-        default=float(os.getenv("PV_GAMMA_PDC", -0.004)),
-        dest="gamma_pdc",
-        help="Temperature coefficient for DC power",
-    )
-    parser.add_argument(
-        "--albedo",
-        type=float,
-        default=float(os.getenv("PV_ALBEDO", 0.2)),
-        help="Ground reflectance",
-    )
-    parser.add_argument(
-        "--model-name",
-        default=os.getenv("PV_MODEL_NAME", "pvlib_pvwatts"),
-        help="Tag identifying the PV simulation model",
-    )
-    parser.add_argument(
-        "--log-level",
-        default=os.getenv("LOG_LEVEL", "INFO"),
-        help="Logging verbosity",
-    )
-    args = parser.parse_args()
-    configure_logging(args.log_level)
-
-    required = {
-        "influx_url": args.influx_url,
-        "influx_token": args.influx_token,
-        "influx_org": args.influx_org,
-    }
-    missing = [name for name, value in required.items() if not value]
-    if missing:
-        parser.error(f"Missing required Influx configuration values: {', '.join(missing)}")
-
-    return args
-
-
 def main() -> None:
-    args = parse_args()
-    config = build_config_from_args(args)
+    configure_logging(os.getenv("LOG_LEVEL", "INFO"))
+    config = build_config_from_env()
     run_simulation(config)
 
 

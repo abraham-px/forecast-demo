@@ -24,7 +24,7 @@ HOURLY_FIELDS: Dict[str, str] = {
 }
 # Always produce a 24h, half-hourly window (48 rows)
 # Ingest horizon (hours) — should exceed PV/load 24h horizon
-FORECAST_HOURS = int(os.getenv("FORECAST_HOURS", "48"))
+FORECAST_HOURS = int(os.getenv("FORECAST_HOURS", "96"))
 # Exactly two points per hour at 30-minute resolution
 HALF_HOURLY_POINTS = FORECAST_HOURS * 2
 
@@ -142,7 +142,6 @@ def write_to_influx(config: Dict[str, str], forecast: pd.DataFrame) -> int:
         LOG.warning("No weather rows to write")
         return 0
 
-    tags = {"provider": "open-meteo"}
     with InfluxDBClient(
         url=config["influx_url"],
         token=config["influx_token"],
@@ -153,8 +152,6 @@ def write_to_influx(config: Dict[str, str], forecast: pd.DataFrame) -> int:
         points = []
         for timestamp, row in forecast.iterrows():
             point = Point(config["measurement"]).time(timestamp.to_pydatetime(), WritePrecision.S)
-            for key, value in tags.items():
-                point = point.tag(key, value)
             for column, column_value in row.items():
                 if pd.isna(column_value):
                     continue

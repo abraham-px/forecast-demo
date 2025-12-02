@@ -12,8 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.weather.txt ./
-RUN pip install --upgrade pip setuptools wheel \
-    && pip install --no-cache-dir -r requirements.weather.txt
+RUN pip install --no-cache-dir -r requirements.weather.txt
 
 COPY app ./app
 

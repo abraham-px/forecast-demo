@@ -1,11 +1,10 @@
 """Daily evaluation job for load and PV forecasts."""
 from __future__ import annotations
 
-import argparse
 import logging
 import os
 from dataclasses import dataclass
-from typing import Iterable, Optional
+from typing import Iterable
 
 import numpy as np
 import pandas as pd
@@ -25,7 +24,6 @@ LOGGER = logging.getLogger("evaluation")
 
 @dataclass
 class EvaluationConfig:
-    site: str
     window_hours: int
     actual_measurement: str
     forecast_measurement: str
@@ -35,6 +33,23 @@ class EvaluationConfig:
     influx_org: str
     influx_bucket: str
     verify_ssl: bool
+
+
+def build_config_from_env() -> EvaluationConfig:
+    return EvaluationConfig(
+        window_hours=int(os.getenv("EVALUATION_WINDOW_HOURS", "24")),
+        actual_measurement=os.getenv("HISTORICAL_MEASUREMENT", "historical_actuals"),
+        forecast_measurement=os.getenv("FORECAST_MEASUREMENT", "forecasts"),
+        evaluation_measurement=os.getenv("EVALUATION_MEASUREMENT", "evaluations"),
+        influx_url=os.getenv("INFLUX_URL", ""),
+        influx_token=os.getenv("INFLUX_TOKEN", ""),
+        influx_org=os.getenv("INFLUX_ORG", ""),
+        influx_bucket=os.getenv("INFLUX_BUCKET", ""),
+        verify_ssl=(
+            str(os.getenv("INFLUX_VERIFY_SSL", "true")).lower()
+            in {"1", "true", "yes", "on"}
+        ),
+    )
 
 
 def configure_logging(level: str = "INFO") -> None:
@@ -57,20 +72,16 @@ def query_influx(
     *,
     start: pd.Timestamp,
     stop: pd.Timestamp,
-    site: Optional[str] = None,
 ) -> pd.DataFrame:
     field_clause = _build_filter_clause(fields, "_field")
     field_filter_block = (
         f'  |> filter(fn: (r) => {field_clause})\n' if field_clause else ""
     )
-    tag_filter_block = (
-        f'  |> filter(fn: (r) => r["site"] == "{site}")\n' if site else ""
-    )
     flux = f"""
 from(bucket: "{bucket}")
   |> range(start: time(v: "{start.isoformat()}"), stop: time(v: "{stop.isoformat()}"))
   |> filter(fn: (r) => r["_measurement"] == "{measurement}")
-{field_filter_block}{tag_filter_block}  |> keep(columns: ["_time", "_field", "_value"])
+{field_filter_block}  |> keep(columns: ["_time", "_field", "_value"])
   |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
   |> sort(columns: ["_time"])
 """
@@ -96,7 +107,6 @@ def fetch_actuals(client: InfluxDBClient, config: EvaluationConfig, start: pd.Ti
         fields=fields,
         start=start,
         stop=stop,
-        site=config.site,
     )
 
 
@@ -109,7 +119,6 @@ def fetch_forecasts(client: InfluxDBClient, config: EvaluationConfig, start: pd.
         fields=fields,
         start=start,
         stop=stop,
-        site=config.site,
     )
 
 
@@ -140,7 +149,6 @@ def write_evaluation(
     point = (
         Point(config.evaluation_measurement)
         .time(issued_at.to_pydatetime(), WritePrecision.NS)
-        .tag("site", config.site)
         .field("window_hours", float(config.window_hours))
         .field("window_start", window_start.isoformat())
         .field("window_end", window_end.isoformat())
@@ -187,80 +195,9 @@ def run_evaluation(config: EvaluationConfig) -> None:
         LOGGER.info("Evaluation written for window %s → %s", start, now)
 
 
-def build_config_from_args(args: argparse.Namespace) -> EvaluationConfig:
-    return EvaluationConfig(
-        site=args.site,
-        window_hours=args.window_hours,
-        actual_measurement=args.actual_measurement,
-        forecast_measurement=args.forecast_measurement,
-        evaluation_measurement=args.evaluation_measurement,
-        influx_url=args.influx_url,
-        influx_token=args.influx_token,
-        influx_org=args.influx_org,
-        influx_bucket=args.influx_bucket,
-        verify_ssl=args.verify_ssl,
-    )
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Compute forecast accuracy metrics")
-    parser.add_argument("--site", default=os.getenv("SITE_NAME", "default"), help="Site tag")
-    parser.add_argument(
-        "--window-hours",
-        type=int,
-        default=int(os.getenv("EVALUATION_WINDOW_HOURS", 24)),
-        help="Evaluation lookback window in hours",
-    )
-    parser.add_argument(
-        "--actual-measurement",
-        default=os.getenv("HISTORICAL_MEASUREMENT", "historical_actuals"),
-        help="Measurement storing actual load/PV data",
-    )
-    parser.add_argument(
-        "--forecast-measurement",
-        default=os.getenv("FORECAST_MEASUREMENT", "forecasts"),
-        help="Measurement storing forecast results",
-    )
-    parser.add_argument(
-        "--evaluation-measurement",
-        default=os.getenv("EVALUATION_MEASUREMENT", "evaluations"),
-        help="Measurement where evaluation metrics will be written",
-    )
-    parser.add_argument("--influx-url", default=os.getenv("INFLUX_URL"), help="Influx URL")
-    parser.add_argument("--influx-token", default=os.getenv("INFLUX_TOKEN"), help="Influx token")
-    parser.add_argument("--influx-org", default=os.getenv("INFLUX_ORG"), help="Influx org")
-    parser.add_argument(
-        "--influx-bucket",
-        default=os.getenv("INFLUX_BUCKET", "AIML"),
-        help="Influx bucket",
-    )
-    parser.add_argument(
-        "--verify-ssl",
-        default=os.getenv("INFLUX_VERIFY_SSL", "true"),
-        type=lambda value: str(value).lower() in {"1", "true", "yes", "on"},
-        help="Verify TLS certificates",
-    )
-    parser.add_argument(
-        "--log-level",
-        default=os.getenv("LOG_LEVEL", "INFO"),
-        help="Logging level",
-    )
-    args = parser.parse_args()
-    configure_logging(args.log_level)
-    required = {
-        "influx_url": args.influx_url,
-        "influx_token": args.influx_token,
-        "influx_org": args.influx_org,
-    }
-    missing = [name for name, value in required.items() if not value]
-    if missing:
-        parser.error(f"Missing required arguments: {', '.join(missing)}")
-    return args
-
-
 def main() -> None:
-    args = parse_args()
-    config = build_config_from_args(args)
+    configure_logging(os.getenv("LOG_LEVEL", "INFO"))
+    config = build_config_from_env()
     run_evaluation(config)
 
 

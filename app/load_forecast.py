@@ -1,18 +1,16 @@
 """Load forecasting agent for the EPC1522 demo.
 
-This module pulls historical load plus aligned weather forecasts from InfluxDB,
-rebuilds the engineered feature set used in the notebook experiments, loads the
-pre-trained XGBoost model from ``model/xgb_model.pkl``, runs a recursive
-multi-step forecast, and writes the resulting horizon back to InfluxDB.
+This module pulls aligned weather forecasts from InfluxDB, rebuilds a lightweight
+feature set, loads the pre-trained XGBoost model from ``model/xgb_model.pkl``,
+generates a 24h (configurable) forecast, and writes the horizon back to InfluxDB.
 """
 from __future__ import annotations
 
-import argparse
 import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Iterable, List, Optional
 
 import jpholiday
 import numpy as np
@@ -31,7 +29,6 @@ except ImportError:  # pragma: no cover - handled at runtime
     SYNCHRONOUS = None  # type: ignore[assignment]
 
 LOGGER = logging.getLogger("load_forecast")
-NETLOAD_LAGS = [1, 2, 24, 48, 72]
 FORECAST_FEATURES = [
     "Temperature",
     "temp_business_hr",
@@ -51,21 +48,14 @@ FORECAST_FEATURES = [
     "is_weekday",
     "is_holiday",
     "week_of_year",
-    "NETLOAD_lag_1",
-    "NETLOAD_lag_2",
-    "NETLOAD_lag_24",
-    "NETLOAD_lag_48",
-    "NETLOAD_lag_72",
 ]
 
 
 @dataclass
 class LoadForecastConfig:
-    site: str
     horizon_hours: int
     history_hours: int
     weather_measurement: str
-    actual_measurement: str
     forecast_measurement: str
     model_path: Path
     influx_url: str
@@ -73,6 +63,24 @@ class LoadForecastConfig:
     influx_org: str
     influx_bucket: str
     verify_ssl: bool
+
+
+def build_config_from_env() -> LoadForecastConfig:
+    return LoadForecastConfig(
+        horizon_hours=int(os.getenv("LOAD_FORECAST_HOURS", "24")),
+        history_hours=int(os.getenv("LOAD_HISTORY_HOURS", "72")),
+        weather_measurement=os.getenv("WEATHER_MEASUREMENT", "weather_forecast"),
+        forecast_measurement=os.getenv("FORECAST_MEASUREMENT", "forecasts"),
+        model_path=Path(os.getenv("LOAD_MODEL_PATH", "model/xgb_model.pkl")),
+        influx_url=os.getenv("INFLUX_URL", ""),
+        influx_token=os.getenv("INFLUX_TOKEN", ""),
+        influx_org=os.getenv("INFLUX_ORG", ""),
+        influx_bucket=os.getenv("INFLUX_BUCKET", ""),
+        verify_ssl=(
+            str(os.getenv("INFLUX_VERIFY_SSL", "true")).lower()
+            in {"1", "true", "yes", "on"}
+        ),
+    )
 
 
 def configure_logging(level: str = "INFO") -> None:
@@ -166,29 +174,6 @@ def fetch_weather(client: InfluxDBClient, config: LoadForecastConfig, *, start: 
     return weather
 
 
-def fetch_netload(
-    client: InfluxDBClient,
-    config: LoadForecastConfig,
-    *,
-    start: pd.Timestamp,
-    stop: pd.Timestamp,
-) -> pd.Series:
-    history = query_influx_frame(
-        client,
-        config.influx_bucket,
-        config.actual_measurement,
-        fields=["netload_kw"],
-        start=start,
-        stop=stop,
-        site=config.site,
-    )
-    if history.empty:
-        raise RuntimeError("No historical netload data available; cannot build lag features")
-    history = history.sort_index().asfreq("30min")
-    history = history.ffill().bfill()
-    return history["netload_kw"].astype(float)
-
-
 def engineer_features(df: pd.DataFrame, *, dropna: bool = False) -> pd.DataFrame:
     df_feat = df.copy()
     df_feat = df_feat.reset_index().rename(columns={"index": "timestamp"})
@@ -238,8 +223,7 @@ def engineer_features(df: pd.DataFrame, *, dropna: bool = False) -> pd.DataFrame
     df_feat["month_sin"] = np.sin(2 * np.pi * df_feat["month"] / 12)
     df_feat["month_cos"] = np.cos(2 * np.pi * df_feat["month"] / 12)
 
-    lag_features = {f"NETLOAD_lag_{lag}" for lag in NETLOAD_LAGS}
-    base_features = set(FORECAST_FEATURES) - lag_features
+    base_features = set(FORECAST_FEATURES)
     keep_cols = base_features | {"timestamp"}
     drop_cols = [col for col in df_feat.columns if col not in keep_cols]
     df_feat = df_feat.drop(columns=drop_cols)
@@ -258,12 +242,9 @@ def predict_forecast(
     *,
     start_time: pd.Timestamp,
     horizon_steps: int,
-    netload_history: pd.Series,
 ) -> pd.DataFrame:
     if features.empty:
         raise RuntimeError("Feature frame is empty; cannot forecast")
-    if netload_history.empty:
-        raise RuntimeError("Netload history is empty; cannot compute lag features")
 
     future_rows = features[features.index >= start_time]
     if future_rows.empty:
@@ -275,40 +256,14 @@ def predict_forecast(
             horizon_steps,
             len(future_rows),
         )
-    predictions: List[float] = []
-    prediction_index: List[pd.Timestamp] = []
-    history = netload_history.sort_index()
-    history = history.asfreq("30min")
-    history = history.ffill().bfill()
-    max_lag_steps = max(NETLOAD_LAGS)
-    last_required_timestamp = start_time - pd.Timedelta(minutes=30)
-    if history.index.empty or history.index.max() < last_required_timestamp:
-        raise RuntimeError("Netload history is stale; unable to seed lag features")
-    if len(history.dropna()) < max_lag_steps:
-        LOGGER.warning("Netload history shorter than required lags. Results may degrade.")
-
-    for timestamp, row in future_rows.iterrows():
-        feature_row = row.copy()
-        missing_lag = None
-        for lag in NETLOAD_LAGS:
-            lag_ts = timestamp - pd.Timedelta(minutes=30 * lag)
-            value = history.get(lag_ts, np.nan)
-            if pd.isna(value):
-                missing_lag = lag
-                break
-            feature_row[f"NETLOAD_lag_{lag}"] = float(value)
-        if missing_lag is not None:
-            raise RuntimeError(
-                f"Missing NETLOAD_lag_{missing_lag} data for timestamp {timestamp}. Ensure historical netload is available."
-            )
-        input_features = pd.DataFrame([feature_row.reindex(FORECAST_FEATURES)])
-        pred = float(model.predict(input_features)[0])
-        predictions.append(pred)
-        prediction_index.append(timestamp)
-        history.loc[timestamp] = pred
-        history = history.sort_index()
-
-    return pd.DataFrame({"timestamp": prediction_index, "load_forecast_kw": predictions})
+    inputs = future_rows.reindex(columns=FORECAST_FEATURES)
+    if inputs.isnull().any().any():
+        LOGGER.warning("Feature matrix contains NaNs; filling forward/backward")
+        inputs = inputs.ffill().bfill()
+    predictions = model.predict(inputs)
+    return pd.DataFrame(
+        {"timestamp": inputs.index, "load_forecast_kw": predictions.astype(float)}
+    )
 
 
 def write_forecasts(
@@ -318,7 +273,6 @@ def write_forecasts(
     client: InfluxDBClient,
     bucket: str,
     org: str,
-    tags: Optional[Dict[str, str]] = None,
 ) -> int:
     if InfluxDBClient is None or Point is None:
         raise RuntimeError("influxdb-client package is required to write forecasts")
@@ -327,7 +281,6 @@ def write_forecasts(
         return 0
 
     records: List[Point] = []
-    tags = tags or {}
     issued_at = pd.Timestamp.now(tz="UTC")
     for _, row in df.iterrows():
         point = (
@@ -336,30 +289,11 @@ def write_forecasts(
             .field("load_forecast_kw", float(row["load_forecast_kw"]))
             .field("issued_at", issued_at.isoformat())
         )
-        for key, value in tags.items():
-            point = point.tag(key, value)
         records.append(point)
 
     write_api = client.write_api(write_options=SYNCHRONOUS)
     write_api.write(bucket=bucket, org=org, record=records)
     return len(records)
-
-
-def build_config_from_args(args: argparse.Namespace) -> LoadForecastConfig:
-    return LoadForecastConfig(
-        site=args.site,
-        horizon_hours=args.horizon_hours,
-        history_hours=args.history_hours,
-        weather_measurement=args.weather_measurement,
-        actual_measurement=args.actual_measurement,
-        forecast_measurement=args.forecast_measurement,
-        model_path=Path(args.model_path),
-        influx_url=args.influx_url,
-        influx_token=args.influx_token,
-        influx_org=args.influx_org,
-        influx_bucket=args.influx_bucket,
-        verify_ssl=args.verify_ssl,
-    )
 
 
 def run_forecast(config: LoadForecastConfig) -> int:
@@ -380,107 +314,26 @@ def run_forecast(config: LoadForecastConfig) -> int:
         weather_df = fetch_weather(client, config, start=history_start, stop=forecast_end)
         features = engineer_features(weather_df)
         horizon_steps = int(config.horizon_hours * 2)
-        lag_window = pd.Timedelta(minutes=30 * max(NETLOAD_LAGS))
-        netload_start = min(history_start, now - lag_window)
-        netload_history = fetch_netload(client, config, start=netload_start, stop=now)
         forecast_df = predict_forecast(
             model,
             features,
             start_time=now,
             horizon_steps=horizon_steps,
-            netload_history=netload_history,
         )
-        tags = {"site": config.site, "model": config.model_path.stem}
         written = write_forecasts(
             forecast_df,
             measurement=config.forecast_measurement,
             client=client,
             bucket=config.influx_bucket,
             org=config.influx_org,
-            tags=tags,
         )
         LOGGER.info("Load forecast completed. Rows written: %s", written)
         return written
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run load forecast inference and persist results")
-    parser.add_argument("--site", default=os.getenv("SITE_NAME", "default"), help="Site tag")
-    parser.add_argument(
-        "--horizon-hours",
-        type=int,
-        default=int(os.getenv("LOAD_FORECAST_HOURS", 24)),
-        dest="horizon_hours",
-        help="Forecast horizon in hours (default: 24)",
-    )
-    parser.add_argument(
-        "--history-hours",
-        type=int,
-        default=int(os.getenv("LOAD_HISTORY_HOURS", 72)),
-        dest="history_hours",
-        help="Historic window to build features (default: 72)",
-    )
-    parser.add_argument(
-        "--weather-measurement",
-        default=os.getenv("WEATHER_MEASUREMENT", "weather_forecast"),
-        help="Measurement storing weather forecasts",
-    )
-    parser.add_argument(
-        "--actual-measurement",
-        default=os.getenv("HISTORICAL_MEASUREMENT", "historical_actuals"),
-        help="Measurement storing historical netload data",
-    )
-    parser.add_argument(
-        "--forecast-measurement",
-        default=os.getenv("FORECAST_MEASUREMENT", "forecasts"),
-        help="Measurement to store load forecasts",
-    )
-    parser.add_argument(
-        "--model-path",
-        default=os.getenv("LOAD_MODEL_PATH", "model/xgb_model.pkl"),
-        help="Path to the serialized XGBoost model",
-    )
-    parser.add_argument("--influx-url", default=os.getenv("INFLUX_URL"), help="InfluxDB URL")
-    parser.add_argument(
-        "--influx-token", default=os.getenv("INFLUX_TOKEN"), help="InfluxDB API token"
-    )
-    parser.add_argument(
-        "--influx-org", default=os.getenv("INFLUX_ORG"), help="InfluxDB organization"
-    )
-    parser.add_argument(
-        "--influx-bucket",
-        default=os.getenv("INFLUX_BUCKET", "AIML"),
-        help="InfluxDB bucket for reading/writing",
-    )
-    parser.add_argument(
-        "--verify-ssl",
-        default=os.getenv("INFLUX_VERIFY_SSL", "true"),
-        type=lambda value: str(value).lower() in {"1", "true", "yes", "on"},
-        help="Toggle TLS certificate verification",
-    )
-    parser.add_argument(
-        "--log-level",
-        default=os.getenv("LOG_LEVEL", "INFO"),
-        help="Logging verbosity",
-    )
-    args = parser.parse_args()
-    configure_logging(args.log_level)
-
-    required = {
-        "influx_url": args.influx_url,
-        "influx_token": args.influx_token,
-        "influx_org": args.influx_org,
-    }
-    missing = [name for name, value in required.items() if not value]
-    if missing:
-        parser.error(f"Missing required Influx configuration values: {', '.join(missing)}")
-
-    return args
-
-
 def main() -> None:
-    args = parse_args()
-    config = build_config_from_args(args)
+    configure_logging(os.getenv("LOG_LEVEL", "INFO"))
+    config = build_config_from_env()
     run_forecast(config)
 
 
