@@ -165,7 +165,7 @@ from(bucket: \"{bucket}\")
     if frames.empty:
         return pd.DataFrame()
     frames = frames.rename(columns={"_time": "timestamp"})
-    frames["timestamp"] = pd.to_datetime(frames["timestamp"], utc=True)
+    frames["timestamp"] = pd.to_datetime(frames["timestamp"])
     frames = frames.set_index("timestamp").sort_index()
     frames = frames.loc[:, [col for col in fields if col in frames.columns]]
     return frames
@@ -197,7 +197,7 @@ def fetch_weather(
 def engineer_features(df: pd.DataFrame, *, dropna: bool = False) -> pd.DataFrame:
     df_feat = df.copy()
     df_feat = df_feat.reset_index().rename(columns={"index": "timestamp"})
-    df_feat["timestamp"] = pd.to_datetime(df_feat["timestamp"], utc=True)
+    df_feat["timestamp"] = pd.to_datetime(df_feat["timestamp"])
 
     df_feat["hour"] = df_feat["timestamp"].dt.hour
     df_feat["day_of_week"] = df_feat["timestamp"].dt.dayofweek
@@ -302,7 +302,7 @@ def write_forecasts(
         return 0
 
     records: List[Point] = []
-    issued_at = pd.Timestamp.now(tz="UTC")
+
     for _, row in df.iterrows():
         point = (
             Point(measurement)
