@@ -49,7 +49,7 @@ FORECAST_FEATURES = [
     "time_frame",
     "is_holiday",
     # "week_of_year",
-]
+] # must be kept in sync with model training
 
 
 @dataclass
@@ -64,6 +64,7 @@ class LoadForecastConfig:
     influx_org: str
     influx_bucket: str
     verify_ssl: bool
+    timezone: str
 
 
 def build_config_from_env() -> LoadForecastConfig:
@@ -81,6 +82,7 @@ def build_config_from_env() -> LoadForecastConfig:
             str(os.getenv("INFLUX_VERIFY_SSL", "true")).lower()
             in {"1", "true", "yes", "on"}
         ),
+        timezone=os.getenv("SITE_TIMEZONE", "UTC"),
     )
 
 
@@ -106,6 +108,17 @@ def _build_flux_filter_list(values: Iterable[str], field: str) -> str:
     if not clauses:
         return ""
     return " or ".join(clauses)
+
+
+def _resolve_start(ts_env: Optional[str], tz: str) -> pd.Timestamp:
+    if ts_env:
+        ts = pd.Timestamp(ts_env)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(tz)
+        else:
+            ts = ts.tz_convert(tz)
+        return ts.tz_convert("UTC")
+    return pd.Timestamp.now(tz="UTC")
 
 
 def _calculate_season(month: int) -> int:
@@ -300,10 +313,11 @@ def write_forecasts(
 
 def run_forecast(config: LoadForecastConfig) -> int:
     model = load_xgb_model(config.model_path)
-    now = pd.Timestamp.now(tz="UTC").floor("30min")
-    history_start = now - pd.Timedelta(hours=config.history_hours)
+    start_override = os.getenv("LOAD_START_DATE") or os.getenv("START_DATE")
+    window_start = _resolve_start(start_override, config.timezone).floor("30min")
+    history_start = window_start - pd.Timedelta(hours=config.history_hours)
     # Pad forecast window by 30 minutes to ensure enough rows after resampling.
-    forecast_end = now + pd.Timedelta(hours=config.horizon_hours) + pd.Timedelta(
+    forecast_end = window_start + pd.Timedelta(hours=config.horizon_hours) + pd.Timedelta(
         minutes=30
     )
 
@@ -318,12 +332,23 @@ def run_forecast(config: LoadForecastConfig) -> int:
     ) as client:
         weather_df = fetch_weather(client, config, start=history_start, stop=forecast_end)
         features = engineer_features(weather_df)
-        horizon_steps = int(config.horizon_hours * 2) # 30-min steps
+        horizon_steps = int(config.horizon_hours * 2)  # 30-min steps
         forecast_df = predict_forecast(
             model,
             features,
-            start_time=now,
+            start_time=window_start,
             horizon_steps=horizon_steps,
+        )
+        local_start = window_start.tz_convert(config.timezone)
+        local_end = (
+            window_start + pd.Timedelta(hours=config.horizon_hours)
+        ).tz_convert(config.timezone)
+        LOGGER.info(
+            "Load window UTC %s -> %s | local %s -> %s",
+            window_start,
+            window_start + pd.Timedelta(hours=config.horizon_hours),
+            local_start,
+            local_end,
         )
         written = write_forecasts(
             forecast_df,
