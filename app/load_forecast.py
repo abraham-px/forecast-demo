@@ -195,6 +195,11 @@ def fetch_weather(
     if weather.empty:
         raise RuntimeError("No weather data returned from Influx. Run ingest first.")
     weather = weather.rename(columns={"temp_air": "Temperature"})
+    weather.index = (
+        weather.index.tz_convert(config.timezone).tz_localize(None)
+        if weather.index.tz is not None
+        else weather.index
+    )
     weather = weather.sort_index().asfreq("30min", method="pad")
     return weather
 
