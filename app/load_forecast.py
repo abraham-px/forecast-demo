@@ -171,7 +171,13 @@ from(bucket: \"{bucket}\")
     return frames
 
 
-def fetch_weather(client: InfluxDBClient, config: LoadForecastConfig, *, start: pd.Timestamp, stop: pd.Timestamp) -> pd.DataFrame:
+def fetch_weather(
+    client: InfluxDBClient,
+    config: LoadForecastConfig,
+    *,
+    start: pd.Timestamp,
+    stop: pd.Timestamp,
+) -> pd.DataFrame:
     weather = query_influx_frame(
         client,
         config.influx_bucket,
@@ -302,7 +308,6 @@ def write_forecasts(
             Point(measurement)
             .time(pd.Timestamp(row["timestamp"]).to_pydatetime(), WritePrecision.NS)
             .field("load_forecast_kw", float(row["load_forecast_kw"]))
-            .field("issued_at", issued_at.isoformat())
         )
         records.append(point)
 
@@ -316,10 +321,7 @@ def run_forecast(config: LoadForecastConfig) -> int:
     start_override = os.getenv("LOAD_START_DATE") or os.getenv("START_DATE")
     window_start = _resolve_start(start_override, config.timezone).floor("30min")
     history_start = window_start - pd.Timedelta(hours=config.history_hours)
-    # Pad forecast window by 30 minutes to ensure enough rows after resampling.
-    forecast_end = window_start + pd.Timedelta(hours=config.horizon_hours) + pd.Timedelta(
-        minutes=30
-    )
+    forecast_end = window_start + pd.Timedelta(hours=config.horizon_hours)
 
     if InfluxDBClient is None:
         raise RuntimeError("influxdb-client package is required for load forecast agent")
