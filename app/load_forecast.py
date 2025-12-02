@@ -141,6 +141,7 @@ def query_influx_frame(
     start: pd.Timestamp,
     stop: pd.Timestamp,
     site: Optional[str] = None,
+    timezone: str = "UTC",
 ) -> pd.DataFrame:
     field_filter = _build_flux_filter_list(fields, "_field")
     field_filter_block = (
@@ -149,9 +150,11 @@ def query_influx_frame(
     tag_filter_block = (
         f'  |> filter(fn: (r) => r["site"] == "{site}")\n' if site else ""
     )
+    tz_start = start.tz_localize(timezone) if start.tzinfo is None else start.tz_convert(timezone)
+    tz_stop = stop.tz_localize(timezone) if stop.tzinfo is None else stop.tz_convert(timezone)
     flux = f"""
 from(bucket: \"{bucket}\")
-  |> range(start: time(v: \"{start.isoformat()}\"), stop: time(v: \"{stop.isoformat()}\"))
+  |> range(start: time(v: \"{tz_start.isoformat()}\"), stop: time(v: \"{tz_stop.isoformat()}\")) 
   |> filter(fn: (r) => r[\"_measurement\"] == \"{measurement}\")
 {field_filter_block}{tag_filter_block}  |> keep(columns: [\"_time\", \"_field\", \"_value\"])
   |> pivot(rowKey: [\"_time\"], columnKey: [\"_field\"], valueColumn: \"_value\")
@@ -187,6 +190,7 @@ def fetch_weather(
         start=start,
         stop=stop,
         site=None,
+        timezone=config.timezone,
     )
     if weather.empty:
         raise RuntimeError("No weather data returned from Influx. Run ingest first.")
