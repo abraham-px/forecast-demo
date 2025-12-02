@@ -301,7 +301,10 @@ def run_forecast(config: LoadForecastConfig) -> int:
     model = load_xgb_model(config.model_path)
     now = pd.Timestamp.now(tz="UTC").floor("30min")
     history_start = now - pd.Timedelta(hours=config.history_hours)
-    forecast_end = now + pd.Timedelta(hours=config.horizon_hours)
+    # Pad forecast window by 30 minutes to ensure enough rows after resampling.
+    forecast_end = now + pd.Timedelta(hours=config.horizon_hours) + pd.Timedelta(
+        minutes=30
+    )
 
     if InfluxDBClient is None:
         raise RuntimeError("influxdb-client package is required for load forecast agent")
