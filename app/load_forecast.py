@@ -46,8 +46,8 @@ FORECAST_FEATURES = [
     "day_of_week_sin",
     "day_of_week_cos",
     # "is_weekday",
+    "time_frame",
     "is_holiday",
-    'time_frame',
     # "week_of_year",
 ]
 
