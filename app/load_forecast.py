@@ -30,24 +30,25 @@ except ImportError:  # pragma: no cover - handled at runtime
 
 LOGGER = logging.getLogger("load_forecast")
 FORECAST_FEATURES = [
-    "Temperature",
+    # "Temperature",
     "temp_business_hr",
-    "temp_lag_1_day",
-    "temp_rolling_mean_3hr",
-    "temp_rolling_std_3hr",
-    "temp_rolling_mean_24hr",
-    "temp_squared",
+    # "temp_lag_1_day",
+    # "temp_rolling_mean_3hr",
+    # "temp_rolling_std_3hr",
+    # "temp_rolling_mean_24hr",
+    # "temp_squared",
     "hour_sin",
     "hour_cos",
-    "season",
+    # "season",
     "is_business_hour",
     "month_sin",
     "month_cos",
     "day_of_week_sin",
     "day_of_week_cos",
-    "is_weekday",
+    # "is_weekday",
     "is_holiday",
-    "week_of_year",
+    'time_frame',
+    # "week_of_year",
 ]
 
 
@@ -162,7 +163,7 @@ def fetch_weather(client: InfluxDBClient, config: LoadForecastConfig, *, start: 
         client,
         config.influx_bucket,
         config.weather_measurement,
-        fields=["temp_air", "ghi", "dni", "dhi", "wind_speed"],
+        fields=["temp_air", "ghi"],
         start=start,
         stop=stop,
         site=None,
@@ -184,7 +185,7 @@ def engineer_features(df: pd.DataFrame, *, dropna: bool = False) -> pd.DataFrame
     df_feat["month"] = df_feat["timestamp"].dt.month
     df_feat["is_weekday"] = df_feat["day_of_week"].apply(lambda x: 1 if x < 6 else 0)
     df_feat["is_holiday"] = df_feat["timestamp"].apply(lambda x: 1 if jpholiday.is_holiday(x) else 0)
-    df_feat["is_business_hour"] = ((df_feat["hour"] >= 8) & (df_feat["hour"] <= 22)).astype(int)
+    df_feat["is_business_hour"] = ((df_feat["hour"] >= 8) & (df_feat["hour"] <= 19)).astype(int) # technos business hours are 8:00 AM to 7:00 PM
     df_feat["time_frame"] = df_feat["hour"] * 2 + (df_feat["timestamp"].dt.minute // 30) + 1
     df_feat["week_of_year"] = df_feat["timestamp"].dt.isocalendar().week.astype(int)
     df_feat["season"] = df_feat["month"].apply(_calculate_season)
@@ -196,14 +197,14 @@ def engineer_features(df: pd.DataFrame, *, dropna: bool = False) -> pd.DataFrame
     df_feat["temp_rolling_mean_3hr"] = (
         df_feat["Temperature"]
         .shift(1)
-        .rolling(window=6, min_periods=1)
+        .rolling(window=12, min_periods=1)
         .mean()
         .fillna(df_feat["Temperature"])
     )
     df_feat["temp_rolling_std_3hr"] = (
         df_feat["Temperature"]
         .shift(1)
-        .rolling(window=6, min_periods=1)
+        .rolling(window=12, min_periods=1)
         .std()
         .fillna(0.0)
     )
@@ -313,7 +314,7 @@ def run_forecast(config: LoadForecastConfig) -> int:
     ) as client:
         weather_df = fetch_weather(client, config, start=history_start, stop=forecast_end)
         features = engineer_features(weather_df)
-        horizon_steps = int(config.horizon_hours * 2)
+        horizon_steps = int(config.horizon_hours * 2) # 30-min steps
         forecast_df = predict_forecast(
             model,
             features,
