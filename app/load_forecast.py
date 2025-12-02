@@ -331,7 +331,9 @@ def run_forecast(config: LoadForecastConfig) -> int:
     start_override = os.getenv("LOAD_START_DATE") or os.getenv("START_DATE")
     window_start = _resolve_start(start_override, config.timezone).floor("30min")
     history_start = window_start - pd.Timedelta(hours=config.history_hours)
-    forecast_end = window_start + pd.Timedelta(hours=config.horizon_hours)
+    forecast_end = window_start + pd.Timedelta(hours=config.horizon_hours) + pd.Timedelta(
+        minutes=30
+    )
 
     if InfluxDBClient is None:
         raise RuntimeError("influxdb-client package is required for load forecast agent")
@@ -354,22 +356,9 @@ def run_forecast(config: LoadForecastConfig) -> int:
         local_end = window_start + pd.Timedelta(hours=config.horizon_hours)
         LOGGER.info("Load window local %s -> %s", window_start, local_end)
         forecast_df["timestamp"] = pd.to_datetime(forecast_df["timestamp"])
-        forecast_df["timestamp"] = (
-            forecast_df["timestamp"]
-            .dt.tz_localize(config.timezone)
-            .dt.tz_convert("UTC")
-        )
-        local_start = window_start.tz_convert(config.timezone)
-        local_end = (
-            window_start + pd.Timedelta(hours=config.horizon_hours)
-        ).tz_convert(config.timezone)
-        LOGGER.info(
-            "Load window UTC %s -> %s | local %s -> %s",
-            window_start,
-            window_start + pd.Timedelta(hours=config.horizon_hours),
-            local_start,
-            local_end,
-        )
+        forecast_df["timestamp"] = forecast_df["timestamp"].dt.tz_localize(
+            config.timezone
+        ).dt.tz_convert("UTC")
         written = write_forecasts(
             forecast_df,
             measurement=config.forecast_measurement,
