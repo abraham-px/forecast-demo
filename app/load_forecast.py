@@ -117,8 +117,9 @@ def _resolve_start(ts_env: Optional[str], tz: str) -> pd.Timestamp:
             ts = ts.tz_localize(tz)
         else:
             ts = ts.tz_convert(tz)
-        return ts.tz_convert("UTC")
-    return pd.Timestamp.now(tz="UTC")
+    else:
+        ts = pd.Timestamp.now(tz=tz)
+    return ts.tz_localize(None)
 
 
 def _calculate_season(month: int) -> int:
@@ -165,7 +166,7 @@ from(bucket: \"{bucket}\")
     if frames.empty:
         return pd.DataFrame()
     frames = frames.rename(columns={"_time": "timestamp"})
-    frames["timestamp"] = pd.to_datetime(frames["timestamp"])
+    frames["timestamp"] = pd.to_datetime(frames["timestamp"], utc =False)
     frames = frames.set_index("timestamp").sort_index()
     frames = frames.loc[:, [col for col in fields if col in frames.columns]]
     return frames
@@ -182,7 +183,7 @@ def fetch_weather(
         client,
         config.influx_bucket,
         config.weather_measurement,
-        fields=["temp_air", "ghi"],
+        fields=["temp_air", "ghi", "dni", "dhi", "wind_speed"],
         start=start,
         stop=stop,
         site=None,
@@ -197,7 +198,7 @@ def fetch_weather(
 def engineer_features(df: pd.DataFrame, *, dropna: bool = False) -> pd.DataFrame:
     df_feat = df.copy()
     df_feat = df_feat.reset_index().rename(columns={"index": "timestamp"})
-    df_feat["timestamp"] = pd.to_datetime(df_feat["timestamp"])
+    df_feat["timestamp"] = pd.to_datetime(df_feat["timestamp"], utc=False)
 
     df_feat["hour"] = df_feat["timestamp"].dt.hour
     df_feat["day_of_week"] = df_feat["timestamp"].dt.dayofweek
@@ -340,6 +341,14 @@ def run_forecast(config: LoadForecastConfig) -> int:
             features,
             start_time=window_start,
             horizon_steps=horizon_steps,
+        )
+        local_end = window_start + pd.Timedelta(hours=config.horizon_hours)
+        LOGGER.info("Load window local %s -> %s", window_start, local_end)
+        forecast_df["timestamp"] = pd.to_datetime(forecast_df["timestamp"])
+        forecast_df["timestamp"] = (
+            forecast_df["timestamp"]
+            .dt.tz_localize(config.timezone)
+            .dt.tz_convert("UTC")
         )
         local_start = window_start.tz_convert(config.timezone)
         local_end = (
