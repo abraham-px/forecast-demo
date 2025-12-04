@@ -6,8 +6,11 @@ services:
     container_name: epc1522-weather
     env_file:
       - .env
+    environment:
+      SCHEDULER_JOBS: weather_ingest
+      SCHEDULER_POLL_SECONDS: "60"
     restart: unless-stopped
-    command: ["python", "app/scheduler.py", "--jobs", "weather_ingest", "--poll-seconds", "60"]
+    command: ["python", "app/scheduler.py"]
 
   forecast-agents:
     build:
@@ -18,13 +21,8 @@ services:
       - .env
     volumes:
       - ./model:/app/model
+    environment:
+      SCHEDULER_JOBS: load_forecast,pv_simulation,evaluation
+      SCHEDULER_POLL_SECONDS: "60"
     restart: unless-stopped
-    command:
-      [
-        "python",
-        "app/scheduler.py",
-        "--jobs",
-        "load_forecast,pv_simulation,evaluation",
-        "--poll-seconds",
-        "60",
-      ]
+    command: ["python", "app/scheduler.py"]
