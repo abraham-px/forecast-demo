@@ -22,9 +22,9 @@ HOURLY_FIELDS: Dict[str, str] = {
     "direct_normal_irradiance": "dni",
     "diffuse_radiation": "dhi",
 }
-# Always produce a 24h, half-hourly window (48 rows)
+
 # Ingest horizon (hours) — should exceed PV/load 24h horizon
-FORECAST_HOURS = int(os.getenv("FORECAST_HOURS", "96"))
+FORECAST_HOURS = int(os.getenv("FORECAST_HOURS", "96")) # 96h = 4 days
 # Exactly two points per hour at 30-minute resolution
 HALF_HOURLY_POINTS = FORECAST_HOURS * 2
 

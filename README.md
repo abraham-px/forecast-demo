@@ -1,4 +1,4 @@
-## EPC1522 Load & PV Forecasting Demo
+## EPC1522 Load & PV Forecasting testing
 
 This repository packages a lightweight end‑to‑end forecasting demo for an EPC1522
 running Portainer‑managed containers. The stack runs independent agents on their
@@ -6,10 +6,10 @@ own schedules via a simple Python scheduler:
 
 1. **Weather ingest** (`app/ingest_weather.py`) pulls Open‑Meteo data every 3 h,
    aligns it to 30‑minute cadence, and writes to `weather_forecast`. Horizon is
-   set via `FORECAST_HOURS` (default 48h) to cover multiple downstream cycles.
+   set via `FORECAST_HOURS` for half hourly intervals
 2. **PV simulation** (`app/solarpv_simu.py`) runs pvlib ModelChain on those weather
    rows and writes 24h of AC PV power (`solarpv_forecast_kw`) to `forecasts`.
-3. **Load forecaster** (`app/load_forecast.py`) now consumes only weather/time
+3. **Load forecaster** (`app/load_forecast.py`) consumes only weather/time
    features—no netload lags are required. By default it writes a 24h horizon to
    `forecasts` using the bundled XGBoost model.
 4. **Evaluation** (`app/evaluation.py`) computes daily accuracy metrics (optional).
@@ -18,28 +18,17 @@ The `app/scheduler.py` module triggers jobs independently using per‑job interv
 from `.env` (`WEATHER/LOAD/PV_INTERVAL_MINUTES`).
 
 
-### Contents
-
-- `app/`: agents and the scheduler
-- `model/xgb_model.pkl`: serialized load model artifact
-- `AGENTS.md`: contributor and agent guidelines
-- `.env`: editable config consumed by every module
- - `dockerfile.weather`: minimal image for weather ingest
- - `dockerfile.forecast`: full image for PV/load/evaluation
- - `requirements.weather.txt`: minimal deps for ingest
-
 
 ## Prerequisites
 
 - Docker or Docker Compose v2
 - Access to the target InfluxDB instance (URL, token, org, bucket)
-- CNC machinery friendly network path to Open-Meteo API
 - EPC1522 (or any x86_64 host) running Portainer for deployment
 
 
 ### Python Dependencies
 
-`requirements.txt` specifies the exact versions installed in the forecast container:
+`requirements.forecast.txt` specifies the exact versions installed in the forecast container:
 `numpy`, `pandas`, `requests`, `influxdb-client`, `jpholiday`, `joblib`,
 `pvlib`, `xgboost`, etc. These are installed automatically during the Docker
 build phase.
@@ -71,24 +60,18 @@ All runtime parameters flow through `.env`; key entries:
 
 ```bash
 # build split images
-docker compose build --no-cache weather-ingest forecast-agents
+docker compose build --no-cache
 
-# run only ingest + PV
-docker compose up -d weather-ingest forecast-agents
+# start 
+docker compose up -d
 ```
 
-Logs show each job when due based on intervals. To run single jobs:
-
-```bash
-docker compose run --rm weather-ingest python app/ingest_weather.py
-docker compose run --rm forecast-agents python app/scheduler.py --jobs pv_simulation --run-once
-```
 
 ### Stopping / restarting
 
 ```bash
-docker compose stop weather-ingest forecast-agents
-docker compose start weather-ingest forecast-agents
+docker compose down -v
+docker compose up -d
 ```
 
 
@@ -100,14 +83,6 @@ entire window is in the past. `PV_START_DATE` can be set separately for PV;
 otherwise it falls back to `START_DATE`.
 
 
-## Manual Agent Runs
-
-You can invoke any agent directly inside the container for troubleshooting:
-
-```bash
-docker compose run --rm weather-ingest python app/ingest_weather.py
-docker compose run --rm forecast-agents python app/solarpv_simu.py
-```
 
 Most options are already defined in `.env`, so flags are only necessary when
 overriding defaults.
@@ -124,5 +99,24 @@ overriding defaults.
 5. Adjust per-job intervals via `.env` and restart services if needed.
 
 The demo is ready to clone on the EPC device, configure through Portainer, and
-showcase automated weather ingest + PV forecasting (load/evaluation optional).
+showcase automated weather ingest + PV and load forecasting (evaluation optional).
 Tune `.env` to change intervals and horizons without code changes.
+
+### Project Structure
+
+```
+app/
+├── ingest_weather.py       # weather agent (weather container)
+├── load_forecast.py        # load agent (forecast container)
+├── solarpv_simu.py         # PV agent (forecast container)
+├── evaluation.py           # optional daily metrics job
+└── scheduler.py            # shared interval scheduler
+
+docker-compose.yml          # defines weather + forecast services
+dockerfile.weather          # minimal weather image
+dockerfile.forecast         # full forecast image (pvlib/xgboost)
+requirements.forecast.txt   # forecast dependencies
+requirements.weather.txt    # weather-only dependencies
+model/xgb_model.pkl         # model artifact
+.env                        # all configuration (env-only agents)
+```

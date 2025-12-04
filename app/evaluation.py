@@ -8,7 +8,7 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import mean_absolute_error, root_mean_squared_error
 
 try:
     from influxdb_client import InfluxDBClient, Point, WritePrecision
@@ -129,8 +129,8 @@ def compute_metric(actual: pd.Series, forecast: pd.Series) -> dict[str, float]:
     y_true = valid.iloc[:, 0].to_numpy(dtype=float)
     y_pred = valid.iloc[:, 1].to_numpy(dtype=float)
     mae = mean_absolute_error(y_true, y_pred)
-    rmse = mean_squared_error(y_true, y_pred, squared=False)
-    denom = np.maximum(np.abs(y_true), 1e-3)
+    rmse = root_mean_squared_error(y_true, y_pred)
+    denom = np.maximum(np.abs(y_true), 5.0)
     mape = np.mean(np.abs((y_true - y_pred) / denom)) * 100.0
     return {"mae": float(mae), "rmse": float(rmse), "mape": float(mape), "count": len(valid)}
 
