@@ -13,20 +13,11 @@ from pathlib import Path
 from typing import Iterable, List, Optional
 
 import jpholiday
+import joblib
 import numpy as np
 import pandas as pd
-
-import joblib
-
-
-try:
-    from influxdb_client import InfluxDBClient, Point, WritePrecision
-    from influxdb_client.client.write_api import SYNCHRONOUS
-except ImportError:  # pragma: no cover - handled at runtime
-    InfluxDBClient = None  # type: ignore[assignment]
-    Point = None  # type: ignore[assignment]
-    WritePrecision = None  # type: ignore[assignment]
-    SYNCHRONOUS = None  # type: ignore[assignment]
+from influxdb_client import InfluxDBClient, Point, WritePrecision
+from influxdb_client.client.write_api import SYNCHRONOUS
 
 LOGGER = logging.getLogger("load_forecast")
 FORECAST_FEATURES = [
@@ -52,7 +43,7 @@ FORECAST_FEATURES = [
 ] # must be kept in sync with model training
 
 
-@dataclass
+@dataclass(frozen=True)
 class LoadForecastConfig:
     horizon_hours: int
     history_hours: int
@@ -78,10 +69,7 @@ def build_config_from_env() -> LoadForecastConfig:
         influx_token=os.getenv("INFLUX_TOKEN", ""),
         influx_org=os.getenv("INFLUX_ORG", ""),
         influx_bucket=os.getenv("INFLUX_BUCKET", ""),
-        verify_ssl=(
-            str(os.getenv("INFLUX_VERIFY_SSL", "true")).lower()
-            in {"1", "true", "yes", "on"}
-        ),
+        verify_ssl=os.getenv("INFLUX_VERIFY_SSL", "false"),
         timezone=os.getenv("SITE_TIMEZONE", "UTC"),
     )
 
@@ -153,13 +141,13 @@ def query_influx_frame(
     tz_start = start.tz_localize(timezone) if start.tzinfo is None else start.tz_convert(timezone)
     tz_stop = stop.tz_localize(timezone) if stop.tzinfo is None else stop.tz_convert(timezone)
     flux = f"""
-from(bucket: \"{bucket}\")
-  |> range(start: time(v: \"{tz_start.isoformat()}\"), stop: time(v: \"{tz_stop.isoformat()}\")) 
-  |> filter(fn: (r) => r[\"_measurement\"] == \"{measurement}\")
-{field_filter_block}{tag_filter_block}  |> keep(columns: [\"_time\", \"_field\", \"_value\"])
-  |> pivot(rowKey: [\"_time\"], columnKey: [\"_field\"], valueColumn: \"_value\")
-  |> sort(columns: [\"_time\"])
-"""
+        from(bucket: \"{bucket}\")
+        |> range(start: time(v: \"{tz_start.isoformat()}\"), stop: time(v: \"{tz_stop.isoformat()}\")) 
+        |> filter(fn: (r) => r[\"_measurement\"] == \"{measurement}\")
+        {field_filter_block}{tag_filter_block}  |> keep(columns: [\"_time\", \"_field\", \"_value\"])
+        |> pivot(rowKey: [\"_time\"], columnKey: [\"_field\"], valueColumn: \"_value\")
+        |> sort(columns: [\"_time\"])
+        """
     # Normalize whitespace introduced by optional blocks
     flux = "\n".join(line for line in flux.splitlines() if line.strip())
     query_api = client.query_api()

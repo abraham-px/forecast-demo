@@ -11,26 +11,14 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, Optional
 
 import pandas as pd
+from influxdb_client import InfluxDBClient, Point, WritePrecision
+from influxdb_client.client.write_api import SYNCHRONOUS
 
-try:
-    from influxdb_client import InfluxDBClient, Point, WritePrecision
-    from influxdb_client.client.write_api import SYNCHRONOUS
-except ImportError:  # pragma: no cover
-    InfluxDBClient = None  # type: ignore[assignment]
-    Point = None  # type: ignore[assignment]
-    WritePrecision = None  # type: ignore[assignment]
-    SYNCHRONOUS = None  # type: ignore[assignment]
+from pvlib.location import Location
+from pvlib.modelchain import ModelChain
+from pvlib.pvsystem import PVSystem
+from pvlib.temperature import TEMPERATURE_MODEL_PARAMETERS
 
-try:  # pragma: no cover
-    from pvlib.location import Location
-    from pvlib.modelchain import ModelChain
-    from pvlib.pvsystem import PVSystem
-    from pvlib.temperature import TEMPERATURE_MODEL_PARAMETERS
-except ImportError:
-    Location = None  # type: ignore[assignment]
-    ModelChain = None  # type: ignore[assignment]
-    PVSystem = None  # type: ignore[assignment]
-    TEMPERATURE_MODEL_PARAMETERS = None  # type: ignore[assignment]
 
 LOGGER = logging.getLogger("solarpv_simu")
 WEATHER_FIELDS = ["ghi", "dni", "dhi", "temp_air", "wind_speed"]
@@ -69,10 +57,7 @@ def build_config_from_env() -> SolarPVSimConfig:
         influx_token=os.getenv("INFLUX_TOKEN", ""),
         influx_org=os.getenv("INFLUX_ORG", ""),
         influx_bucket=os.getenv("INFLUX_BUCKET", ""),
-        verify_ssl=(
-            str(os.getenv("INFLUX_VERIFY_SSL", "true")).lower()
-            in {"1", "true", "yes", "on"}
-        ),
+        verify_ssl=os.getenv("INFLUX_VERIFY_SSL", "false"),
         latitude=float(os.getenv("SITE_LATITUDE", "0")),
         longitude=float(os.getenv("SITE_LONGITUDE", "0")),
         altitude=float(os.getenv("SITE_ALTITUDE", "0")),
@@ -119,13 +104,13 @@ def query_influx_frame(
         f'  |> filter(fn: (r) => r["site"] == "{site}")\n' if site else ""
     )
     flux = f"""
-from(bucket: \"{bucket}\")
-  |> range(start: time(v: \"{start.isoformat()}\"), stop: time(v: \"{stop.isoformat()}\"))
-  |> filter(fn: (r) => r[\"_measurement\"] == \"{measurement}\")
-{field_filter_block}{tag_filter_block}  |> keep(columns: [\"_time\", \"_field\", \"_value\"])
-  |> pivot(rowKey: [\"_time\"], columnKey: [\"_field\"], valueColumn: \"_value\")
-  |> sort(columns: [\"_time\"])
-"""
+        from(bucket: \"{bucket}\")
+        |> range(start: time(v: \"{start.isoformat()}\"), stop: time(v: \"{stop.isoformat()}\"))
+        |> filter(fn: (r) => r[\"_measurement\"] == \"{measurement}\")
+        {field_filter_block}{tag_filter_block}  |> keep(columns: [\"_time\", \"_field\", \"_value\"])
+        |> pivot(rowKey: [\"_time\"], columnKey: [\"_field\"], valueColumn: \"_value\")
+        |> sort(columns: [\"_time\"])
+        """
     flux = "\n".join(line for line in flux.splitlines() if line.strip())
     query_api = client.query_api()
     frames = query_api.query_data_frame(org=client.org, query=flux)

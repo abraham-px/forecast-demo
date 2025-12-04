@@ -1,11 +1,12 @@
-"""Simple weather ingest: fetch 24h Open-Meteo data at 30 min cadence and write to Influx."""
+"""Simple weather ingest: fetch multi-day Open-Meteo data at 30 min cadence and write to Influx."""
 from __future__ import annotations
 
-import logging
-import os
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import logging
 import math
-from typing import Dict
+import os
+from typing import Dict, Iterable
 
 import pandas as pd
 import requests
@@ -23,149 +24,159 @@ HOURLY_FIELDS: Dict[str, str] = {
     "diffuse_radiation": "dhi",
 }
 
-# Ingest horizon (hours) — should exceed PV/load 24h horizon
-FORECAST_HOURS = int(os.getenv("FORECAST_HOURS", "96")) # 96h = 4 days
-# Exactly two points per hour at 30-minute resolution
-HALF_HOURLY_POINTS = FORECAST_HOURS * 2
 
+@dataclass(frozen=True)
+class WeatherConfig:
+    latitude: float
+    longitude: float
+    timezone: str
+    model: str
+    start_date: str | None
+    measurement: str
+    influx_url: str
+    influx_token: str
+    influx_org: str
+    influx_bucket: str
+    forecast_hours: int
 
-def get_config() -> Dict[str, str]:
-    config = {
-        "latitude": os.getenv("SITE_LATITUDE"),
-        "longitude": os.getenv("SITE_LONGITUDE"),
-        "timezone": os.getenv("SITE_TIMEZONE", "UTC"),
-        "model": os.getenv("OPEN_METEO_MODEL", "best_match"),
-        "start_date": os.getenv("START_DATE"),
-        "measurement": os.getenv("WEATHER_MEASUREMENT", "weather_forecast"),
-        "influx_url": os.getenv("INFLUX_URL"),
-        "influx_token": os.getenv("INFLUX_TOKEN"),
-        "influx_org": os.getenv("INFLUX_ORG"),
-        "influx_bucket": os.getenv("INFLUX_BUCKET"),
-        "verify_ssl": False,
-    }
-    missing = [key for key in ("latitude", "longitude", "influx_url", "influx_token", "influx_org", "influx_bucket") if not config[key]]
-    if missing:
-        raise SystemExit(f"Missing required environment values: {', '.join(missing)}")
-    return config
+    @property
+    def half_hour_points(self) -> int:
+        return self.forecast_hours * 2
 
-
-def _compute_window(config: Dict[str, str]) -> tuple[datetime, datetime, bool]:
-    """Return (window_start_utc, window_end_utc, use_archive)."""
-    now_utc = datetime.now(tz=timezone.utc)
-    start_override = config.get("start_date")
-    if start_override:
-        ts = pd.Timestamp(start_override)
-        if ts.tzinfo is None:
-            ts = ts.tz_localize(config["timezone"])  # local date/time
-        else:
-            ts = ts.tz_convert(config["timezone"])  # normalize to local tz
-        window_start = ts.tz_convert(timezone.utc).to_pydatetime()
-    else:
-        window_start = now_utc
-    window_end = window_start + timedelta(hours=FORECAST_HOURS)
-    use_archive = start_override is not None and window_end <= now_utc
-    return window_start, window_end, use_archive
+    @classmethod
+    def from_env(cls) -> WeatherConfig:
+        env = os.getenv
+        required = {
+            "SITE_LATITUDE": env("SITE_LATITUDE"),
+            "SITE_LONGITUDE": env("SITE_LONGITUDE"),
+            "INFLUX_URL": env("INFLUX_URL"),
+            "INFLUX_TOKEN": env("INFLUX_TOKEN"),
+            "INFLUX_ORG": env("INFLUX_ORG"),
+            "INFLUX_BUCKET": env("INFLUX_BUCKET"),
+        }
+        missing = [key for key, value in required.items() if not value]
+        if missing:
+            raise SystemExit(f"Missing required environment values: {', '.join(missing)}")
+        return cls(
+            latitude=float(required["SITE_LATITUDE"]),
+            longitude=float(required["SITE_LONGITUDE"]),
+            timezone=env("SITE_TIMEZONE", "UTC"),
+            model=env("OPEN_METEO_MODEL", "best_match"),
+            start_date=env("START_DATE"),
+            measurement=env("WEATHER_MEASUREMENT", "weather_forecast"),
+            influx_url=required["INFLUX_URL"],
+            influx_token=required["INFLUX_TOKEN"],
+            influx_org=required["INFLUX_ORG"],
+            influx_bucket=required["INFLUX_BUCKET"],
+            forecast_hours=int(env("FORECAST_HOURS", "96")),
+        )
 
 
 def _request_json(url: str, params: dict) -> dict:
-    resp = requests.get(url, params=params, timeout=30)
-    resp.raise_for_status()
-    return resp.json()
+    response = requests.get(url, params=params, timeout=30)
+    response.raise_for_status()
+    return response.json()
 
 
-def fetch_forecast(config: Dict[str, str]) -> pd.DataFrame:
-    window_start, window_end, use_archive = _compute_window(config)
-
-    if use_archive:
-        # Historical day via archive API
-        params = {
-            "latitude": float(config["latitude"]),
-            "longitude": float(config["longitude"]),
-            "hourly": list(HOURLY_FIELDS.keys()),
-            "start_date": window_start.date().isoformat(),
-            "end_date": window_end.date().isoformat(),
-            "timezone": "UTC",
-        }
-        LOG.info(
-            "Requesting Open-Meteo archive for (%s,%s) start=%s end=%s",
-            params["latitude"],
-            params["longitude"],
-            params["start_date"],
-            params["end_date"],
-        )
-        payload = _request_json(OPEN_METEO_ARCHIVE_URL, params)
+def _window(config: WeatherConfig) -> tuple[datetime, datetime, bool]:
+    now_utc = datetime.now(tz=timezone.utc)
+    if config.start_date:
+        ts = pd.Timestamp(config.start_date)
+        ts = ts.tz_localize(config.timezone) if ts.tzinfo is None else ts.tz_convert(config.timezone)
+        start = ts.tz_convert("UTC").to_pydatetime()
     else:
-        # Live forecast
-        params = {
-            "latitude": float(config["latitude"]),
-            "longitude": float(config["longitude"]),
-            "hourly": list(HOURLY_FIELDS.keys()),
-            "models": config["model"],
-            "timezone": "UTC",
-            "forecast_days": max(1, math.ceil(FORECAST_HOURS / 24)),
-        }
-        LOG.info(
-            "Requesting Open-Meteo forecast for (%s,%s) start=%s horizon=%sh",
-            params["latitude"],
-            params["longitude"],
-            window_start.isoformat(),
-            FORECAST_HOURS,
-        )
-        payload = _request_json(OPEN_METEO_URL, params)
+        start = now_utc
+    end = start + timedelta(hours=config.forecast_hours)
+    return start, end, bool(config.start_date and end <= now_utc)
 
+
+def _build_params(config: WeatherConfig, fields: Iterable[str], *, archive: bool, start: datetime, end: datetime) -> dict:
+    base = {
+        "latitude": config.latitude,
+        "longitude": config.longitude,
+        "hourly": list(fields),
+    }
+    if archive:
+        base.update(
+            {
+                "start_date": start.date().isoformat(),
+                "end_date": end.date().isoformat(),
+                "timezone": "UTC",
+            }
+        )
+    else:
+        base.update(
+            {
+                "models": config.model,
+                "timezone": "UTC",
+                "forecast_days": max(1, math.ceil(config.forecast_hours / 24)),
+            }
+        )
+    return base
+
+
+def fetch_forecast(config: WeatherConfig) -> pd.DataFrame:
+    start, end, use_archive = _window(config)
+    params = _build_params(config, HOURLY_FIELDS.keys(), archive=use_archive, start=start, end=end)
+    url = OPEN_METEO_ARCHIVE_URL if use_archive else OPEN_METEO_URL
+    LOG.info(
+        "Requesting Open-Meteo %s for (%s,%s) window_start=%s horizon=%sh",
+        "archive" if use_archive else "forecast",
+        config.latitude,
+        config.longitude,
+        start.isoformat(),
+        config.forecast_hours,
+    )
+    payload = _request_json(url, params)
     hourly = payload.get("hourly")
     if not hourly:
-        LOG.warning("Open-Meteo response missing or empty 'hourly' block")
+        LOG.warning("Open-Meteo response missing hourly block")
         return pd.DataFrame()
-
     frame = pd.DataFrame(hourly)
-    if "time" not in frame.columns:
-        LOG.warning("Open-Meteo hourly payload missing 'time' column")
+    if "time" not in frame:
+        LOG.warning("Open-Meteo payload missing time column")
         return pd.DataFrame()
     frame["time"] = pd.to_datetime(frame["time"], utc=True)
     frame = frame.set_index("time")[list(HOURLY_FIELDS.keys())]
     frame = frame.rename(columns=HOURLY_FIELDS).sort_index()
-
-    # Trim to requested window and upsample to 30 min
-    # Select [start, end) to yield an exact multiple of 30-minute steps
-    mask = (frame.index >= window_start) & (frame.index < window_end)
-    frame = frame.loc[mask]
-    if frame.empty:
-        LOG.warning("No rows found in the requested window")
-        return frame
-    frame = frame.resample("30min").interpolate("time").ffill().bfill()
-    return frame.iloc[:HALF_HOURLY_POINTS]
+    window = frame[(frame.index >= start) & (frame.index < end)]
+    if window.empty:
+        LOG.warning("Forecast window produced no rows")
+        return window
+    window = window.resample("30min").interpolate("time").ffill().bfill()
+    return window.iloc[: config.half_hour_points]
 
 
-def write_to_influx(config: Dict[str, str], forecast: pd.DataFrame) -> int:
+def write_to_influx(config: WeatherConfig, forecast: pd.DataFrame) -> int:
     if forecast.empty:
         LOG.warning("No weather rows to write")
         return 0
-
     with InfluxDBClient(
-        url=config["influx_url"],
-        token=config["influx_token"],
-        org=config["influx_org"],
-        verify_ssl=config["verify_ssl"],
+        url=config.influx_url,
+        token=config.influx_token,
+        org=config.influx_org,
+        verify_ssl=False,
     ) as client:
         write_api = client.write_api(write_options=SYNCHRONOUS)
-        points = []
+        records = []
         for timestamp, row in forecast.iterrows():
-            point = Point(config["measurement"]).time(timestamp.to_pydatetime(), WritePrecision.S)
-            for column, column_value in row.items():
-                if pd.isna(column_value):
-                    continue
-                point = point.field(column, float(column_value))
-            points.append(point)
-        write_api.write(bucket=config["influx_bucket"], org=config["influx_org"], record=points)
-    return len(points)
+            point = Point(config.measurement).time(timestamp.to_pydatetime(), WritePrecision.S)
+            for field, value in row.items():
+                if not pd.isna(value):
+                    point = point.field(field, float(value))
+            records.append(point)
+        write_api.write(bucket=config.influx_bucket, org=config.influx_org, record=records)
+    return len(forecast.index)
 
 
 def main() -> None:
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
-    config = get_config()
-    forecast = fetch_forecast(config)
-    written = write_to_influx(config, forecast)
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO"),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    config = WeatherConfig.from_env()
+    rows = fetch_forecast(config)
+    written = write_to_influx(config, rows)
     LOG.info("Ingest complete. Points written: %s", written)
 
 
