@@ -57,7 +57,8 @@ def build_config_from_env() -> SolarPVSimConfig:
         influx_token=os.getenv("INFLUX_TOKEN", ""),
         influx_org=os.getenv("INFLUX_ORG", ""),
         influx_bucket=os.getenv("INFLUX_BUCKET", ""),
-        verify_ssl=os.getenv("INFLUX_VERIFY_SSL", "false"),
+        verify_ssl=str(os.getenv("INFLUX_VERIFY_SSL", "false")).lower()
+        in {"1", "true", "yes", "on"},
         latitude=float(os.getenv("SITE_LATITUDE", "0")),
         longitude=float(os.getenv("SITE_LONGITUDE", "0")),
         altitude=float(os.getenv("SITE_ALTITUDE", "0")),

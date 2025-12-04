@@ -69,7 +69,8 @@ def build_config_from_env() -> LoadForecastConfig:
         influx_token=os.getenv("INFLUX_TOKEN", ""),
         influx_org=os.getenv("INFLUX_ORG", ""),
         influx_bucket=os.getenv("INFLUX_BUCKET", ""),
-        verify_ssl=os.getenv("INFLUX_VERIFY_SSL", "false"),
+        verify_ssl=str(os.getenv("INFLUX_VERIFY_SSL", "false")).lower()
+        in {"1", "true", "yes", "on"},
         timezone=os.getenv("SITE_TIMEZONE", "UTC"),
     )
 
