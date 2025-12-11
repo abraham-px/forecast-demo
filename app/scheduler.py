@@ -51,8 +51,9 @@ class ScheduledJob:
 
 def run_weather_job() -> None:
     # Import inside the function so weather container doesn't need heavy deps
-    import ingest_weather  # lazy import
-    ingest_weather.main()
+    import ingest_data  # lazy import
+
+    ingest_data.main()
 
 
 def run_load_job() -> None:

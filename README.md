@@ -4,9 +4,11 @@ This repository packages a lightweight end‑to‑end forecasting demo for an EP
 running Portainer‑managed containers. The stack runs independent agents on their
 own schedules via a simple Python scheduler:
 
-1. **Weather ingest** (`app/ingest_weather.py`) pulls Open‑Meteo data every 3 h,
-   aligns it to 30‑minute cadence, and writes to `weather_forecast`. Horizon is
-   set via `FORECAST_HOURS` for half hourly intervals
+1. **Data ingest** (`app/ingest_data.py`) pulls Open‑Meteo data every 3 h,
+   aligns it to 30‑minute cadence, and writes to `weather_forecast`. It also
+   queries the PXC bucket, rolls one week of `PcsData`/`Interconnection` into
+   30‑minute historical rows (`NETLOAD_kw`, `solarPV_kw`) stored in
+   `historical_data`. Horizon is set via `FORECAST_HOURS` for half hourly intervals.
 2. **PV simulation** (`app/solarpv_simu.py`) runs pvlib ModelChain on those weather
    rows and writes 24h of AC PV power (`solarpv_forecast_kw`) to `forecasts`.
 3. **Load forecaster** (`app/load_forecast.py`) consumes only weather/time
@@ -47,6 +49,7 @@ All runtime parameters flow through `.env`; key entries:
 | Influx | `INFLUX_URL`, `INFLUX_TOKEN`, `INFLUX_ORG`, `INFLUX_BUCKET`, `INFLUX_VERIFY_SSL` |
 | Measurements | `WEATHER_MEASUREMENT`, `HISTORICAL_MEASUREMENT`, `FORECAST_MEASUREMENT` |
 | Weather ingest | `FORECAST_HOURS`, `OPEN_METEO_MODEL` |
+| Net load ingest | `PXC_BUCKET`, `HISTORICAL_MEASUREMENT`, `NETLOAD_FIELD`, `SOLAR_FIELD` |
 | Load forecast | `LOAD_FORECAST_HOURS`, `LOAD_HISTORY_HOURS`, `LOAD_MODEL_PATH` |
 | PV simulation | `PV_FORECAST_HOURS`, `PV_SURFACE_TILT`, `PV_SURFACE_AZIMUTH`, `PV_DC_CAPACITY_KW`, `PV_AC_CAPACITY_KW`, `PV_GAMMA_PDC`, `PV_ALBEDO`, `PV_MODEL_NAME` |
 | Evaluation | `EVALUATION_WINDOW_HOURS`, `EVALUATION_MEASUREMENT`, `EVALUATION_INTERVAL_MINUTES` |
@@ -78,9 +81,9 @@ docker compose up -d
 ## Start Dates (Backfill)
 
 Set `START_DATE=YYYY-MM-DD` (or ISO datetime) in `.env` to backfill ingest for a
-fixed window. The script automatically uses Open‑Meteo’s archive API when the
-entire window is in the past. `PV_START_DATE` can be set separately for PV;
-otherwise it falls back to `START_DATE`.
+fixed window. When `START_DATE` is set, the ingest script forces Open‑Meteo’s
+archive API regardless of orbit overlap with “now”. `PV_START_DATE` can be set
+separately for PV; otherwise it falls back to `START_DATE`.
 
 
 
@@ -106,7 +109,7 @@ Tune `.env` to change intervals and horizons without code changes.
 
 ```
 app/
-├── ingest_weather.py       # weather agent (weather container)
+├── ingest_data.py          # weather + net load agent (weather container)
 ├── load_forecast.py        # load agent (forecast container)
 ├── solarpv_simu.py         # PV agent (forecast container)
 ├── evaluation.py           # optional daily metrics job
