@@ -133,8 +133,9 @@ def _resolve_start(ts_env: Optional[str], tz: str) -> pd.Timestamp:
             ts = ts.tz_localize(tz)
         else:
             ts = ts.tz_convert(tz)
-        return ts.tz_convert("UTC")
-    return pd.Timestamp.now(tz="UTC")
+    else:
+        ts = pd.Timestamp.now(tz=tz)
+    return ts.tz_convert("UTC")
 
 
 def fetch_weather(
@@ -164,7 +165,7 @@ def fetch_weather(
     if weather.empty:
         raise RuntimeError("No weather data available for PV simulation")
     # Restrict to the exact window after padding
-    weather = weather[(weather.index >= start) & (weather.index <= stop)]
+    weather = weather[(weather.index >= start) & (weather.index < stop)]
     if weather.empty:
         raise RuntimeError(
             "Weather data missing after trimming to target window. "
@@ -270,7 +271,7 @@ def run_simulation(config: SolarPVSimConfig) -> int:
         raise RuntimeError("influxdb-client is required for PV simulation")
     # Determine window: 48 half-hour slots starting at now or override
     start_override = os.getenv("PV_START_DATE") or os.getenv("START_DATE")
-    window_start = _resolve_start(start_override, config.timezone)
+    window_start = _resolve_start(start_override, config.timezone).ceil("30min")
     horizon_end = window_start + pd.Timedelta(minutes=30 * HALF_HOURLY_POINTS)
 
     with InfluxDBClient(
