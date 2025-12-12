@@ -21,22 +21,22 @@ from influxdb_client.client.write_api import SYNCHRONOUS
 
 LOGGER = logging.getLogger("load_forecast")
 FORECAST_FEATURES = [
-    # "Temperature",
+    "Temperature",
     "temp_business_hr",
     # "temp_lag_1_day",
     # "temp_rolling_mean_3hr",
     # "temp_rolling_std_3hr",
     # "temp_rolling_mean_24hr",
-    # "temp_squared",
+    "temp_squared",
     "hour_sin",
     "hour_cos",
     # "season",
     "is_business_hour",
-    "month_sin",
-    "month_cos",
+    # "month_sin",
+    # "month_cos",
     "day_of_week_sin",
     "day_of_week_cos",
-    # "is_weekday",
+    "is_weekday",
     "time_frame",
     "is_holiday",
     # "week_of_year",
@@ -203,7 +203,7 @@ def engineer_features(df: pd.DataFrame, *, dropna: bool = False) -> pd.DataFrame
     df_feat["month"] = df_feat["timestamp"].dt.month
     df_feat["is_weekday"] = df_feat["day_of_week"].apply(lambda x: 1 if x < 6 else 0)
     df_feat["is_holiday"] = df_feat["timestamp"].apply(lambda x: 1 if jpholiday.is_holiday(x) else 0)
-    df_feat["is_business_hour"] = ((df_feat["hour"] >= 8) & (df_feat["hour"] <= 19)).astype(int) # technos business hours are 8:00 AM to 7:00 PM
+    df_feat['is_business_hour'] = ((df_feat['hour'] >= 8) & (df_feat['hour'] <= 19) & (df_feat['day_of_week'] != 6)).astype(int) # technos business hours are 8:00 AM to 7:00 PM
     df_feat["time_frame"] = df_feat["hour"] * 2 + (df_feat["timestamp"].dt.minute // 30) + 1
     df_feat["week_of_year"] = df_feat["timestamp"].dt.isocalendar().week.astype(int)
     df_feat["season"] = df_feat["month"].apply(_calculate_season)
