@@ -23,8 +23,8 @@ HOURLY_FIELDS: Dict[str, str] = {
     "direct_normal_irradiance": "dni",
     "diffuse_radiation": "dhi",
 }
-PXC_MEASUREMENTS: tuple[str, ...] = ("PcsData", "Interconnection")
-PXC_FIELDS: tuple[str, ...] = ("essPcsActvPwr", "poiActvPwr", "pvActvPwr")
+# PXC_MEASUREMENTS: tuple[str, ...] = ("PcsData", "Interconnection")
+# PXC_FIELDS: tuple[str, ...] = ("essPcsActvPwr", "poiActvPwr", "pvActvPwr")
 
 
 @dataclass(frozen=True)
@@ -39,10 +39,10 @@ class IngestConfig:
     influx_token: str
     influx_org: str
     influx_bucket: str
-    pxc_bucket: str
-    historical_measurement: str
-    netload_field: str
-    solar_field: str
+    # pxc_bucket: str
+    # historical_measurement: str
+    # netload_field: str
+    # solar_field: str
     forecast_hours: int
 
     @property
@@ -74,10 +74,10 @@ class IngestConfig:
             influx_token=required["INFLUX_TOKEN"],
             influx_org=required["INFLUX_ORG"],
             influx_bucket=required["INFLUX_BUCKET"],
-            pxc_bucket=env("PXC_BUCKET", "PXC"),
-            historical_measurement=env("HISTORICAL_MEASUREMENT", "historical_data"),
-            netload_field=env("NETLOAD_FIELD", "netload_kw"),
-            solar_field=env("SOLAR_FIELD", "solarPV_kw"),
+            # pxc_bucket=env("PXC_BUCKET", "PXC"),
+            # historical_measurement=env("HISTORICAL_MEASUREMENT", "historical_data"),
+            # netload_field=env("NETLOAD_FIELD", "netload_kw"),
+            # solar_field=env("SOLAR_FIELD", "solarPV_kw"),
             forecast_hours=int(env("FORECAST_HOURS", "96")),
         )
 
@@ -94,9 +94,9 @@ def _now_utc(config: IngestConfig) -> datetime:
     return local_now.tz_convert("UTC").to_pydatetime()
 
 
-def _flux_filter(column: str, values: Sequence[str]) -> str:
-    clauses = [f'r["{column}"] == "{value}"' for value in values]
-    return " or ".join(clauses)
+# def _flux_filter(column: str, values: Sequence[str]) -> str:
+#     clauses = [f'r["{column}"] == "{value}"' for value in values]
+#     return " or ".join(clauses)
 
 
 def _window(config: IngestConfig) -> tuple[datetime, datetime, bool]:
@@ -190,92 +190,92 @@ def write_weather_to_influx(config: IngestConfig, forecast: pd.DataFrame) -> int
     return len(forecast.index)
 
 
-def _as_dataframe(result: pd.DataFrame | Sequence[pd.DataFrame]) -> pd.DataFrame:
-    if isinstance(result, list):
-        frames = [frame for frame in result if not frame.empty]
-        if not frames:
-            return pd.DataFrame()
-        return pd.concat(frames, ignore_index=True)
-    return result
+# def _as_dataframe(result: pd.DataFrame | Sequence[pd.DataFrame]) -> pd.DataFrame:
+#     if isinstance(result, list):
+#         frames = [frame for frame in result if not frame.empty]
+#         if not frames:
+#             return pd.DataFrame()
+#         return pd.concat(frames, ignore_index=True)
+#     return result
 
 
-def fetch_historical_data(config: IngestConfig) -> pd.DataFrame:
-    stop = _now_utc(config)
-    start = stop - timedelta(days=7)
-    measurement_filter = _flux_filter("_measurement", PXC_MEASUREMENTS)
-    field_filter = _flux_filter("_field", PXC_FIELDS)
-    flux = f"""
-from(bucket: "{config.pxc_bucket}")
-  |> range(start: {start.isoformat()}, stop: {stop.isoformat()})
-  |> filter(fn: (r) => {measurement_filter})
-  |> filter(fn: (r) => {field_filter})
-  |> aggregateWindow(every: 30m, fn: mean, createEmpty: false)
-  |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
-  |> keep(columns: ["_time","{PXC_FIELDS[0]}","{PXC_FIELDS[1]}","{PXC_FIELDS[2]}"])
-  |> sort(columns:["_time"])
-"""
-    with InfluxDBClient(
-        url=config.influx_url,
-        token=config.influx_token,
-        org=config.influx_org,
-        verify_ssl=False,
-        timeout=30000,
-    ) as client:
-        query_api = client.query_api()
-        raw = query_api.query_data_frame(org=config.influx_org, query=flux)
-    frame = _as_dataframe(raw)
-    if frame.empty or "_time" not in frame:
-        LOG.warning("No PXC rows returned for the last 7 days")
-        return pd.DataFrame()
-    value_columns = [col for col in PXC_FIELDS if col in frame.columns]
-    if not value_columns:
-        LOG.warning("PXC query returned timestamps without expected fields")
-        return pd.DataFrame()
-    columns = ["_time"] + value_columns
-    frame = frame[columns]
-    frame = frame.rename(columns={"_time": "time"})
-    frame["time"] = pd.to_datetime(frame["time"], utc=True)
-    frame = frame.set_index("time").sort_index()
-    frame = frame.resample("30min").mean()
-    result = pd.DataFrame(index=frame.index)
-    result[config.netload_field] = frame.reindex(columns=PXC_FIELDS).sum(axis=1, min_count=1)
-    if "pvActvPwr" in frame.columns:
-        result[config.solar_field] = frame["pvActvPwr"]
-    else:
-        LOG.warning("pvActvPwr not found in PXC data; solar field will be empty")
-    result = result.dropna(how="all")
-    return result
+# def fetch_historical_data(config: IngestConfig) -> pd.DataFrame:
+#     stop = _now_utc(config)
+#     start = stop - timedelta(days=7)
+#     measurement_filter = _flux_filter("_measurement", PXC_MEASUREMENTS)
+#     field_filter = _flux_filter("_field", PXC_FIELDS)
+#     flux = f"""
+# from(bucket: "{config.pxc_bucket}")
+#   |> range(start: {start.isoformat()}, stop: {stop.isoformat()})
+#   |> filter(fn: (r) => {measurement_filter})
+#   |> filter(fn: (r) => {field_filter})
+#   |> aggregateWindow(every: 30m, fn: mean, createEmpty: false)
+#   |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+#   |> keep(columns: ["_time","{PXC_FIELDS[0]}","{PXC_FIELDS[1]}","{PXC_FIELDS[2]}"])
+#   |> sort(columns:["_time"])
+# """
+#     with InfluxDBClient(
+#         url=config.influx_url,
+#         token=config.influx_token,
+#         org=config.influx_org,
+#         verify_ssl=False,
+#         timeout=30000,
+#     ) as client:
+#         query_api = client.query_api()
+#         raw = query_api.query_data_frame(org=config.influx_org, query=flux)
+#     frame = _as_dataframe(raw)
+#     if frame.empty or "_time" not in frame:
+#         LOG.warning("No PXC rows returned for the last 7 days")
+#         return pd.DataFrame()
+#     value_columns = [col for col in PXC_FIELDS if col in frame.columns]
+#     if not value_columns:
+#         LOG.warning("PXC query returned timestamps without expected fields")
+#         return pd.DataFrame()
+#     columns = ["_time"] + value_columns
+#     frame = frame[columns]
+#     frame = frame.rename(columns={"_time": "time"})
+#     frame["time"] = pd.to_datetime(frame["time"], utc=True)
+#     frame = frame.set_index("time").sort_index()
+#     frame = frame.resample("30min").mean()
+#     result = pd.DataFrame(index=frame.index)
+#     result[config.netload_field] = frame.reindex(columns=PXC_FIELDS).sum(axis=1, min_count=1)
+#     if "pvActvPwr" in frame.columns:
+#         result[config.solar_field] = frame["pvActvPwr"]
+#     else:
+#         LOG.warning("pvActvPwr not found in PXC data; solar field will be empty")
+#     result = result.dropna(how="all")
+#     return result
 
 
-def write_historical_data(config: IngestConfig, historical: pd.DataFrame) -> int:
-    if historical.empty:
-        LOG.warning("No historical rows to write")
-        return 0
-    with InfluxDBClient(
-        url=config.influx_url,
-        token=config.influx_token,
-        org=config.influx_org,
-        verify_ssl=False,
-    ) as client:
-        write_api = client.write_api(write_options=SYNCHRONOUS)
-        records = []
-        for timestamp, row in historical.iterrows():
-            point = Point(config.historical_measurement).time(timestamp.to_pydatetime(), WritePrecision.S)
-            wrote_field = False
-            netload_value = row.get(config.netload_field)
-            if netload_value is not None and not pd.isna(netload_value):
-                point = point.field(config.netload_field, float(netload_value))
-                wrote_field = True
-            solar_value = row.get(config.solar_field)
-            if solar_value is not None and not pd.isna(solar_value):
-                point = point.field(config.solar_field, float(solar_value))
-                wrote_field = True
-            if wrote_field:
-                records.append(point)
-        if not records:
-            return 0
-        write_api.write(bucket=config.influx_bucket, org=config.influx_org, record=records)
-    return len(records)
+# def write_historical_data(config: IngestConfig, historical: pd.DataFrame) -> int:
+#     if historical.empty:
+#         LOG.warning("No historical rows to write")
+#         return 0
+#     with InfluxDBClient(
+#         url=config.influx_url,
+#         token=config.influx_token,
+#         org=config.influx_org,
+#         verify_ssl=False,
+#     ) as client:
+#         write_api = client.write_api(write_options=SYNCHRONOUS)
+#         records = []
+#         for timestamp, row in historical.iterrows():
+#             point = Point(config.historical_measurement).time(timestamp.to_pydatetime(), WritePrecision.S)
+#             wrote_field = False
+#             netload_value = row.get(config.netload_field)
+#             if netload_value is not None and not pd.isna(netload_value):
+#                 point = point.field(config.netload_field, float(netload_value))
+#                 wrote_field = True
+#             solar_value = row.get(config.solar_field)
+#             if solar_value is not None and not pd.isna(solar_value):
+#                 point = point.field(config.solar_field, float(solar_value))
+#                 wrote_field = True
+#             if wrote_field:
+#                 records.append(point)
+#         if not records:
+#             return 0
+#         write_api.write(bucket=config.influx_bucket, org=config.influx_org, record=records)
+#     return len(records)
 
 
 def main() -> None:
@@ -286,12 +286,12 @@ def main() -> None:
     config = IngestConfig.from_env()
     forecast_rows = fetch_forecast(config)
     weather_written = write_weather_to_influx(config, forecast_rows)
-    historical_rows = fetch_historical_data(config)
-    historical_written = write_historical_data(config, historical_rows)
+    # historical_rows = fetch_historical_data(config)
+    # historical_written = write_historical_data(config, historical_rows)
     LOG.info(
-        "Ingest complete. Weather points written=%s Historical points written=%s",
+        "Ingest complete. Weather points written=%s",
         weather_written,
-        historical_written,
+        # historical_written,
     )
 
 
