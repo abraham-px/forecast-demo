@@ -83,7 +83,7 @@ class IngestConfig:
 
 
 def _request_json(url: str, params: dict) -> dict:
-    response = requests.get(url, params=params, timeout=30)
+    response = requests.get(url, params=params, timeout=30000)
     response.raise_for_status()
     return response.json()
 
@@ -219,7 +219,7 @@ from(bucket: "{config.pxc_bucket}")
         token=config.influx_token,
         org=config.influx_org,
         verify_ssl=False,
-        timeout=300,
+        timeout=30000,
     ) as client:
         query_api = client.query_api()
         raw = query_api.query_data_frame(org=config.influx_org, query=flux)
